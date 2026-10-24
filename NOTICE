@@ -1,5 +1,5 @@
-qant-rs
-Copyright 2026 qant-rs contributors
+qanten
+Copyright 2026 qanten contributors
 
 This product is an unofficial, community-maintained Rust SDK for Q.ANT
 photonic native processing units. It is not affiliated with, endorsed by or
@@ -8,19 +8,19 @@ supported by Q.ANT GmbH. "Q.ANT" is a trademark of Q.ANT GmbH.
 Portions of this software are derived from the Q.ANT Native Computing Toolkit
 (https://github.com/Q-ANT-GmbH/qant_native_computing_toolkit, v2.4.0),
 Copyright Q.ANT GmbH, licensed under the Apache License, Version 2.0:
-  - the driver ABI (struct layouts and function signatures) in crates/qant-sys
+  - the driver ABI (struct layouts and function signatures) in crates/qanten-sys
   - the algorithms for convolution lowering, pooling, batch normalisation and
-    the photonic KAN layer in crates/qant/src/ops, and the CPU simulator,
+    the photonic KAN layer in crates/qanten/src/ops, and the CPU simulator,
     which were rewritten and extended (batching, dilation, groups, output
     padding, non-divisible adaptive pooling, bug fixes).
 
 The pretrained digit-recognition weights in
-crates/qant/examples/data/digit_recognition.safetensors are converted from
+crates/qanten/examples/data/digit_recognition.safetensors are converted from
 https://github.com/Q-ANT-GmbH/qant_native_computing_toolkit_examples
 (python/digit_recognition/network_weights.npz), Copyright Q.ANT GmbH,
 Apache License, Version 2.0.
 
-The 100 sample images in crates/qant/examples/data/mnist_t10k_100-*.idx are
+The 100 sample images in crates/qanten/examples/data/mnist_t10k_100-*.idx are
 taken from the MNIST database by Yann LeCun, Corinna Cortes and Christopher
 J.C. Burges, available under the Creative Commons Attribution-Share Alike 3.0
 license.

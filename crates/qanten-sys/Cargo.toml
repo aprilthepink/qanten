@@ -1,0 +1,19 @@
+[package]
+name = "qanten-sys"
+description = "Raw FFI bindings to the Q.ANT native computing driver (libqant_native_computing_driver), loaded at runtime"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories = ["external-ffi-bindings", "hardware-support"]
+
+[dependencies]
+libloading.workspace = true
+half.workspace = true
+
+[lints]
+workspace = true

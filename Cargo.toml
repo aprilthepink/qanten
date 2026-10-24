@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/qant-sys", "crates/qant", "crates/qant-cli", "crates/qant-mock-driver"]
+members = ["crates/qanten-sys", "crates/qanten", "crates/qanten-cli", "crates/qanten-mock-driver"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,13 +8,13 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/aprilthepink/qanten"
-authors = ["qant-rs contributors"]
-keywords = ["qant", "photonic", "npu", "accelerator", "neural-network"]
+authors = ["qanten contributors"]
+keywords = ["qanten", "qant", "photonic", "npu", "neural-network"]
 categories = ["hardware-support", "science", "api-bindings"]
 
 [workspace.dependencies]
-qant-sys = { path = "crates/qant-sys", version = "0.1.0" }
-qant = { path = "crates/qant", version = "0.1.0", default-features = false }
+qanten-sys = { path = "crates/qanten-sys", version = "0.1.0" }
+qanten = { path = "crates/qanten", version = "0.1.0", default-features = false }
 half = "2.7"
 libloading = "0.9"
 thiserror = "2"

@@ -416,13 +416,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "qant"
+name = "qanten"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "half",
  "ndarray",
- "qant-sys",
+ "qanten-sys",
  "rayon",
  "safetensors",
  "serde",
@@ -432,12 +432,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "qant-cli"
+name = "qanten-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "qant",
+ "qanten",
  "serde",
  "serde_json",
  "tracing",
@@ -445,15 +445,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "qant-mock-driver"
+name = "qanten-mock-driver"
 version = "0.1.0"
 dependencies = [
- "qant",
- "qant-sys",
+ "qanten",
+ "qanten-sys",
 ]
 
 [[package]]
-name = "qant-sys"
+name = "qanten-sys"
 version = "0.1.0"
 dependencies = [
  "half",

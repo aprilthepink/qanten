@@ -1,4 +1,4 @@
-# qant-rs
+# qanten
 
 **A batteries-included Rust SDK for Q.ANT photonic NPUs.**
 
@@ -8,9 +8,9 @@ This workspace gives Rust its own first-class interface, built on the same drive
 
 | Crate | What it is |
 |---|---|
-| [`qant`](crates/qant) | Safe high-level library: device handles, tensors, ops, NN layers, model loading, simulator |
-| [`qant-sys`](crates/qant-sys) | Raw FFI to `libqant_native_computing_driver`, loaded at runtime |
-| [`qant-cli`](crates/qant-cli) | `qant` command: `doctor`, `devices`, `info`, `sensors`, `perf`, `bench`, `selftest` |
+| [`qanten`](crates/qanten) | Safe high-level library: device handles, tensors, ops, NN layers, model loading, simulator |
+| [`qanten-sys`](crates/qanten-sys) | Raw FFI to `libqant_native_computing_driver`, loaded at runtime |
+| [`qanten-cli`](crates/qanten-cli) | `qanten` command: `doctor`, `devices`, `info`, `sensors`, `perf`, `bench`, `selftest` |
 
 > Unofficial community project, not affiliated with or supported by Q.ANT GmbH.
 
@@ -37,13 +37,13 @@ This workspace gives Rust its own first-class interface, built on the same drive
 
 ```toml
 [dependencies]
-qant = { version = "0.1", features = ["safetensors"] }
+qanten = { version = "0.1", features = ["safetensors"] }
 ```
 
 ```rust
-use qant::prelude::*;
+use qanten::prelude::*;
 
-fn main() -> qant::Result<()> {
+fn main() -> qanten::Result<()> {
     let npu = Npu::auto(0)?; // hardware if available, simulator otherwise
 
     // Single ops
@@ -87,7 +87,7 @@ cargo run --example digit_recognition --features safetensors
 | Backend | Accuracy |
 |---|---|
 | numpy f32 reference | 94.6 % |
-| `qant` simulator (bf16) | 94.6 % |
+| `qanten` simulator (bf16) | 94.6 % |
 | simulator, noise σ = 0.05 | 94.5 % |
 | simulator, noise σ = 0.2 | 92.5 % |
 | simulator, noise σ = 0.5 | 80.3 % |
@@ -100,17 +100,17 @@ cargo run --example digit_recognition --features safetensors
 | `Npu::simulator()` | Shared, exact simulator. |
 | `Npu::simulator_with(SimConfig { noise_std, memory_limit_bytes, num_npus, .. })` | Configured simulator. |
 | `Npu::auto(id)` | Hardware if available, else simulator (logs a warning). Check `npu.is_simulated()`. |
-| `Npu::from_env(id)` | Chosen by `QANT_BACKEND=driver\|sim\|auto`. |
+| `Npu::from_env(id)` | Chosen by `QANTEN_BACKEND=driver\|sim\|auto`. |
 | `Npu::with_backend(Arc<dyn Backend>, id)` | Your own `Backend` implementation. |
 
 Environment variables:
 
 | Variable | Effect |
 |---|---|
-| `QANT_DRIVER_LIB` | Path to `libqant_native_computing_driver.so` if it is not on the loader path |
-| `QANT_BACKEND` | Backend for `Npu::from_env` |
+| `QANTEN_DRIVER_LIB` | Path to `libqant_native_computing_driver.so` if it is not on the loader path |
+| `QANTEN_BACKEND` | Backend for `Npu::from_env` |
 
-## Cargo features of `qant`
+## Cargo features of `qanten`
 
 | Feature | Default | Adds |
 |---|---|---|
@@ -134,10 +134,10 @@ All tensors are `bf16`, the NPU's native format. Constructors and
 
 ## Coming from the Python or C API
 
-| Q.ANT Python / C | `qant` |
+| Q.ANT Python / C | `qanten` |
 |---|---|
 | `generic.init_npu(0)` / `release_npu(0)` | `let npu = Npu::open(0)?;` (released on drop) |
-| `generic.get_available_npus()` | `qant::devices()` |
+| `generic.get_available_npus()` | `qanten::devices()` |
 | `native.mul_elementwise` | `ops::mul` |
 | `native.calc_scaled_periodic_nl_fprop` | `ops::periodic_nl` |
 | `ai.linear_fprop` + `ai.add_bias_fprop` | `ops::linear(&npu, &x, &w, Some(&b))` |
@@ -151,17 +151,17 @@ All tensors are `bf16`, the NPU's native format. Constructors and
 | `generic.allocate` / `upload` / `upload_into` / `download` | `DeviceBuffer::<Weights \| Features>::{alloc, from_tensor, upload, download}` |
 | `info.get_driver_info`, `get_sensor_info`, `get_version_info` | `npu.driver_version()`, `npu.device_info()` |
 | `info.get_perf_counter` / `reset_perf_counter` | `npu.perf_counters()` / `npu.reset_perf_counters()` |
-| `info.setup_logging` | `qant::setup_driver_logging` |
+| `info.setup_logging` | `qanten::setup_driver_logging` |
 
 Behaviour that differs from upstream v2.4.0:
 
 - In-place `add_bias` only added the bias to the first row of a batch.
-  `qant` adds it to every row.
+  `qanten` adds it to every row.
 - A failed device free in `Drop` built an error but never reported it.
-  `qant` logs it through `tracing`.
+  `qanten` logs it through `tracing`.
 - Upstream rejects batched input for softmax, pooling, batch norm and
   transposed conv, and does not support dilation, groups or output padding.
-  `qant` supports all of these.
+  `qanten` supports all of these.
 
 ## Testing without hardware
 
@@ -169,20 +169,20 @@ Behaviour that differs from upstream v2.4.0:
 cargo test --workspace --all-features   # simulator-backed tests
 
 # The real dlopen + FFI path, against a mock driver that exports the driver's C symbols:
-cargo build -p qant-mock-driver
-QANT_DRIVER_LIB=$PWD/target/debug/libqant_native_computing_driver.so \
-  cargo test -p qant --test driver_ffi
+cargo build -p qanten-mock-driver
+QANTEN_DRIVER_LIB=$PWD/target/debug/libqant_native_computing_driver.so \
+  cargo test -p qanten --test driver_ffi
 ```
 
-On a machine with a Q.ANT card, run `qant doctor` and then `qant selftest`,
+On a machine with a Q.ANT card, run `qanten doctor` and then `qanten selftest`,
 which runs every op on the NPU and compares the result with the simulator.
 
 ## Status
 
 The FFI layer follows the driver ABI used by Q.ANT's toolkit v2.4.0. It has
 been tested against the mock driver, **not yet on Q.ANT hardware**. Reports
-from people with hardware are very welcome, especially `qant selftest` and
-`qant bench` output.
+from people with hardware are very welcome, especially `qanten selftest` and
+`qanten bench` output.
 
 ## License
 
