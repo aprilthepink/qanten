@@ -42,12 +42,14 @@
 pub mod backend;
 mod device;
 mod error;
+pub mod fallback;
 pub mod info;
 mod memory;
 pub mod nn;
 #[cfg(feature = "numpy")]
 pub mod numpy;
 pub mod ops;
+pub mod pool;
 pub mod profile;
 mod rng;
 mod tensor;

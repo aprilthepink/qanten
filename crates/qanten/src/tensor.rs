@@ -249,6 +249,61 @@ impl Tensor {
             .fold(0.0, f32::max))
     }
 
+    /// Splits along the first dimension into at most `parts` pieces of
+    /// near-equal size (sizes differ by at most one; empty pieces are omitted).
+    pub fn split_batch(&self, parts: usize) -> Vec<Tensor> {
+        let Some(&n) = self.shape.first() else {
+            return vec![self.clone()];
+        };
+        let parts = parts.clamp(1, n.max(1));
+        let row = self.len() / n.max(1);
+        let (base, extra) = (n / parts, n % parts);
+        let mut out = Vec::with_capacity(parts);
+        let mut start = 0;
+        for p in 0..parts {
+            let rows = base + usize::from(p < extra);
+            if rows == 0 {
+                continue;
+            }
+            let mut shape = self.shape.clone();
+            shape[0] = rows;
+            out.push(Tensor {
+                data: self.data[start * row..(start + rows) * row].to_vec(),
+                shape,
+            });
+            start += rows;
+        }
+        if out.is_empty() {
+            out.push(self.clone());
+        }
+        out
+    }
+
+    /// Concatenates tensors along the first dimension. All other dimensions must match.
+    pub fn concat_batch(parts: &[Tensor]) -> Result<Tensor> {
+        let Some(first) = parts.first() else {
+            bail_shape!("concat_batch: no tensors given");
+        };
+        ensure_shape!(
+            first.rank() > 0,
+            "concat_batch: tensors must have at least one dimension"
+        );
+        let mut shape = first.shape.clone();
+        shape[0] = 0;
+        let mut data = Vec::with_capacity(parts.iter().map(Tensor::len).sum());
+        for p in parts {
+            ensure_shape!(
+                p.rank() == first.rank() && p.shape[1..] == first.shape[1..],
+                "concat_batch: shape {:?} does not match {:?}",
+                p.shape,
+                first.shape
+            );
+            shape[0] += p.shape[0];
+            data.extend_from_slice(&p.data);
+        }
+        Tensor::new(data, shape)
+    }
+
     /// The shape as a fixed-size array, if the rank is `D`.
     pub fn dims<const D: usize>(&self) -> Result<[usize; D]> {
         self.shape.as_slice().try_into().map_err(|_| {

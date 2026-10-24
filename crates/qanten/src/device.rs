@@ -209,14 +209,30 @@ impl Npu {
     /// original handle gives [`Error::DeviceMismatch`]).
     pub fn profiled(&self) -> (Npu, crate::profile::Profiler) {
         let (backend, profiler) = crate::profile::wrap(Arc::clone(&self.inner.backend));
-        let npu = Npu {
+        (self.wrapped(backend), profiler)
+    }
+
+    /// A handle to the same device whose small streamed operations run on
+    /// the host CPU instead, as decided by `policy`, plus a monitor counting
+    /// where operations went. See [`FallbackPolicy`](crate::fallback::FallbackPolicy).
+    pub fn with_cpu_fallback(
+        &self,
+        policy: crate::fallback::FallbackPolicy,
+    ) -> (Npu, crate::fallback::FallbackMonitor) {
+        let (backend, monitor) = crate::fallback::wrap(Arc::clone(&self.inner.backend), policy);
+        (self.wrapped(backend), monitor)
+    }
+
+    /// A handle that uses `backend` (a wrapper around this device's backend)
+    /// and keeps this handle alive; it never releases the device itself.
+    pub(crate) fn wrapped(&self, backend: Arc<dyn Backend>) -> Npu {
+        Npu {
             inner: Arc::new(Inner {
                 id: self.id(),
                 backend,
                 parent: Some(self.clone()),
             }),
-        };
-        (npu, profiler)
+        }
     }
 
     /// Current sensor readings and firmware info.
