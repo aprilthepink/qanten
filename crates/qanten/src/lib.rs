@@ -49,6 +49,8 @@ mod memory;
 pub mod nn;
 #[cfg(feature = "numpy")]
 pub mod numpy;
+#[cfg(feature = "onnx")]
+pub mod onnx;
 pub mod ops;
 pub mod pool;
 pub mod profile;

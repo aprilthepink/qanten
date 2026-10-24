@@ -122,6 +122,7 @@ Environment variables:
 | `driver` | yes | Hardware backend (runtime-loaded, nothing needed at build time) |
 | `safetensors` | | `StateDict::{load,save}_safetensors` (f32/f16/bf16/f64/int → bf16) |
 | `numpy` | | `.npy` / `.npz` load and save (what Q.ANT's Python examples ship) |
+| `onnx` | | run `.onnx` models exported from PyTorch & co. |
 | `ndarray` | | `Tensor` ⇄ `ndarray::ArrayD` |
 | `serde` | | `Serialize` for device info, sensors, perf counters |
 | `full` | | All of the above |

@@ -20,11 +20,13 @@ driver = ["dep:qanten-sys"]
 ndarray = ["dep:ndarray"]
 ## Load PyTorch / NumPy weights from `.safetensors` files.
 safetensors = ["dep:safetensors"]
+## Load and run ONNX models.
+onnx = []
 ## Load and save NumPy `.npy` / `.npz` files.
 numpy = ["dep:miniz_oxide"]
 ## `serde::Serialize` for device info, sensor readings and perf counters.
 serde = ["dep:serde"]
-full = ["driver", "ndarray", "numpy", "safetensors", "serde"]
+full = ["driver", "ndarray", "numpy", "onnx", "safetensors", "serde"]
 
 [dependencies]
 qanten-sys = { workspace = true, optional = true }
