@@ -1,5 +1,8 @@
 //! `qanten`: command-line tool for Q.ANT photonic NPUs.
 
+mod run;
+
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -85,6 +88,39 @@ enum Command {
     },
     /// Check the driver installation and explain what is missing.
     Doctor,
+    /// Run a model file (.onnx, or .safetensors/.npz with --arch) on the NPU.
+    Run {
+        /// Model file.
+        model: PathBuf,
+        /// Input as `name=file.npy` or just `file.npy` (repeatable). Random data if omitted.
+        #[arg(short, long = "input")]
+        inputs: Vec<String>,
+        /// Write every output to `<dir>/<name>.npy`.
+        #[arg(short, long)]
+        output_dir: Option<PathBuf>,
+        /// Architecture for weight files (.safetensors / .npz).
+        #[arg(long, value_enum)]
+        arch: Option<run::Arch>,
+        /// Activation between layers for `--arch mlp`.
+        #[arg(long, value_enum, default_value = "relu")]
+        activation: run::Activation,
+        /// Batch size for random inputs.
+        #[arg(long, default_value_t = 1)]
+        batch: usize,
+        /// Repeat the run N times and report the average time.
+        #[arg(long, default_value_t = 1)]
+        iters: usize,
+        /// Print a per-operation profile.
+        #[arg(long)]
+        profile: bool,
+        #[arg(short, long, default_value_t = 0)]
+        npu: u32,
+    },
+    /// List the tensors of a .safetensors/.npz/.npy file, or summarise an .onnx model.
+    Inspect {
+        /// File to inspect.
+        file: PathBuf,
+    },
 }
 
 fn open(sim: bool, id: u32) -> Result<Npu> {
@@ -155,6 +191,30 @@ fn run(cli: Cli) -> Result<ExitCode> {
             return selftest(&open(cli.sim, npu)?, cli.json, tolerance);
         }
         Command::Doctor => return doctor(cli.json),
+        Command::Run {
+            model,
+            inputs,
+            output_dir,
+            arch,
+            activation,
+            batch,
+            iters,
+            profile,
+            npu,
+        } => run::run(
+            &open(cli.sim, npu)?,
+            run::RunArgs {
+                model,
+                inputs,
+                output_dir,
+                arch,
+                activation,
+                batch,
+                iters,
+                profile,
+            },
+        )?,
+        Command::Inspect { file } => run::inspect(&file, &Npu::simulator())?,
     }
     Ok(ExitCode::SUCCESS)
 }
