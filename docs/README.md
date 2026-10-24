@@ -19,6 +19,7 @@ layers, a simulator, a CLI, and a graphics crate that moves CPU-side 3D work ont
 | [Neural networks](qanten/nn.md) | layers, `Sequential`, `StateDict`, loading PyTorch weights |
 | [Device memory](qanten/device-memory.md) | `DeviceBuffer<Weights / Features>`, keeping data on the NPU |
 | [Errors](qanten/errors.md) | the `Error` enum and what each variant means |
+| [Profiling](qanten/profiling.md) | per-op time, data moved, MACs and device memory |
 
 ## `qanten-graphics` (3D workloads)
 

@@ -71,6 +71,9 @@ enum Command {
         batch: usize,
         #[arg(long, default_value_t = 20)]
         iters: usize,
+        /// Print a per-operation profile (calls, time, bytes moved, MACs).
+        #[arg(long)]
+        profile: bool,
     },
     /// Run every op on the NPU and compare against the simulator.
     Selftest {
@@ -133,7 +136,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
             cols,
             batch,
             iters,
-        } => bench(&open(cli.sim, npu)?, cli.json, rows, cols, batch, iters)?,
+            profile,
+        } => {
+            let base = open(cli.sim, npu)?;
+            if profile {
+                let (npu, profiler) = base.profiled();
+                bench(&npu, cli.json, rows, cols, batch, iters)?;
+                if cli.json {
+                    print_json(&profiler.report())?;
+                } else {
+                    println!("\n{}", profiler.report());
+                }
+            } else {
+                bench(&base, cli.json, rows, cols, batch, iters)?;
+            }
+        }
         Command::Selftest { npu, tolerance } => {
             return selftest(&open(cli.sim, npu)?, cli.json, tolerance);
         }

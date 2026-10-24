@@ -14,10 +14,16 @@ pub const BACKEND_ENV: &str = "QANTEN_BACKEND";
 struct Inner {
     id: u32,
     backend: Arc<dyn Backend>,
+    /// Set for wrapper handles (e.g. profiled): the parent owns the device and
+    /// releases it; the wrapper just keeps it alive.
+    parent: Option<Npu>,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        if self.parent.is_some() {
+            return;
+        }
         if let Err(err) = self.backend.release_npu(self.id) {
             tracing::warn!(npu = self.id, %err, "failed to release NPU");
         }
@@ -101,6 +107,7 @@ impl Npu {
             inner: Arc::new(Inner {
                 id: 0,
                 backend: sim,
+                parent: None,
             }),
         }
     }
@@ -113,6 +120,7 @@ impl Npu {
             inner: Arc::new(Inner {
                 id: 0,
                 backend: sim,
+                parent: None,
             }),
         }
     }
@@ -156,7 +164,11 @@ impl Npu {
     pub fn with_backend(backend: Arc<dyn Backend>, id: u32) -> Result<Self> {
         backend.init_npu(id)?;
         Ok(Self {
-            inner: Arc::new(Inner { id, backend }),
+            inner: Arc::new(Inner {
+                id,
+                backend,
+                parent: None,
+            }),
         })
     }
 
@@ -187,6 +199,24 @@ impl Npu {
                 Arc::as_ptr(&self.inner.backend),
                 Arc::as_ptr(&other.inner.backend),
             )
+    }
+
+    /// Current sensor readings and firmware info.
+    /// A handle to the same device that records every call it makes, plus the
+    /// [`Profiler`](crate::profile::Profiler) to read the numbers. Use the
+    /// returned handle for the work you want measured; buffers and layers
+    /// created through it belong to it (mixing them with buffers from the
+    /// original handle gives [`Error::DeviceMismatch`]).
+    pub fn profiled(&self) -> (Npu, crate::profile::Profiler) {
+        let (backend, profiler) = crate::profile::wrap(Arc::clone(&self.inner.backend));
+        let npu = Npu {
+            inner: Arc::new(Inner {
+                id: self.id(),
+                backend,
+                parent: Some(self.clone()),
+            }),
+        };
+        (npu, profiler)
     }
 
     /// Current sensor readings and firmware info.

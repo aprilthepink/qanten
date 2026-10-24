@@ -48,6 +48,7 @@ pub mod nn;
 #[cfg(feature = "numpy")]
 pub mod numpy;
 pub mod ops;
+pub mod profile;
 mod rng;
 mod tensor;
 

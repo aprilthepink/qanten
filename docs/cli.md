@@ -11,7 +11,7 @@ cargo install qanten-cli        # installs the `qanten` binary
 | `qanten info [-n ID]` | backend, driver version, firmware, Zephyr version, board serial, 12 V power |
 | `qanten sensors [-n ID] [--watch SECS]` | all temperatures, voltages and the 12 V current; refreshes with `--watch` |
 | `qanten perf [-n ID] [--reset]` | elapsed and stalled time, utilisation |
-| `qanten bench [-n ID] [--rows R --cols C --batch B --iters I]` | matrix-vector throughput (GMAC/s), weights uploaded per call vs resident |
+| `qanten bench [-n ID] [--rows R --cols C --batch B --iters I] [--profile]` | matrix-vector throughput (GMAC/s), weights uploaded per call vs resident; `--profile` adds a per-op table |
 | `qanten selftest [-n ID] [--tolerance T]` | runs every op on the NPU and compares with the simulator; exit code 1 on failure |
 
 Global flags:
