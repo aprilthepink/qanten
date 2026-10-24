@@ -1,6 +1,6 @@
 //! Profiling: per-operation counts, time, data moved and work done.
 //!
-//! [`Npu::profiled`] returns a handle that records every primitive call it
+//! [`Npu::profiled`](crate::Npu::profiled) returns a handle that records every primitive call it
 //! makes, and a [`Profiler`] to read the numbers:
 //!
 //! ```
