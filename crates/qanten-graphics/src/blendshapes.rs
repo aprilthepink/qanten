@@ -1,5 +1,7 @@
 //! Morph targets (blendshapes) for many characters at once.
 //!
+//! ![One sphere, four morph targets, six characters in one NPU call (example `blendshapes`)](https://raw.githubusercontent.com/aprilthepink/qanten/main/docs/images/blendshapes.png)
+//!
 //! `vertex = base + Σ_s weight_s · delta_s`. The delta matrix
 //! `[3·vertices, shapes]` is uploaded once and stays resident; each frame
 //! only the weights of every character go up (`characters × shapes` values).
@@ -66,10 +68,12 @@ impl Blendshapes {
         Ok(self)
     }
 
+    /// Vertices in the base mesh.
     pub fn vertex_count(&self) -> usize {
         self.base.len()
     }
 
+    /// Number of morph targets.
     pub fn shape_count(&self) -> usize {
         self.shapes
     }

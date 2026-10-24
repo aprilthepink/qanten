@@ -26,6 +26,7 @@
 //! magnitude of each output: fine for physics proxies, culling, baking and
 //! previews, not a replacement for exact final-frame geometry.
 
+#![warn(missing_docs)]
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 mod accel;

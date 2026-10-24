@@ -36,6 +36,7 @@ use crate::tensor::Tensor;
 
 /// Anything that maps a tensor to a tensor.
 pub trait Module: Send + Sync + std::fmt::Debug {
+    /// Runs the layer on `x`.
     fn forward(&self, x: &Tensor) -> Result<Tensor>;
 
     /// Short layer name used in debug output.
@@ -69,6 +70,7 @@ pub struct Sequential {
 }
 
 impl Sequential {
+    /// An empty model.
     pub fn new() -> Self {
         Self::default()
     }
@@ -85,14 +87,17 @@ impl Sequential {
         self.layers.push(Box::new(layer));
     }
 
+    /// Number of layers.
     pub fn len(&self) -> usize {
         self.layers.len()
     }
 
+    /// `true` if there are no layers.
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
     }
 
+    /// The layers, in order.
     pub fn layers(&self) -> &[Box<dyn Module>] {
         &self.layers
     }

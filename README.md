@@ -15,6 +15,10 @@ This workspace gives Rust its own first-class interface, built on the same drive
 
 > Unofficial community project, not affiliated with or supported by Q.ANT GmbH.
 
+**Documentation:** guides for every module are in [`docs/`](docs/README.md), API reference on docs.rs.
+
+![Gerstner ocean computed on the NPU](docs/images/ocean.png)
+
 ## Why use this instead of the C or Python bindings
 
 - **Builds anywhere.** The driver is `dlopen`ed at runtime, so `cargo build`

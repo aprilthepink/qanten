@@ -2,6 +2,10 @@
 
 Offload CPU-side graphics and 3D work to Q.ANT photonic NPUs.
 
+![Gerstner ocean computed on the NPU](https://raw.githubusercontent.com/aprilthepink/qanten/main/docs/images/ocean.png)
+
+Full guides with pictures for every module: [docs/graphics](https://github.com/aprilthepink/qanten/tree/main/docs/graphics).
+
 Engines keep some geometry work on the CPU because the result is needed
 there, not on the GPU: wave heights for buoyancy, deformed meshes for
 collision and picking, baked lighting in asset pipelines. Each module here
@@ -38,7 +42,9 @@ let buoy = ocean.sample(3.0, 40.0, t);   // exact height + vertical velocity
 ```sh
 cargo run --release -p qanten-graphics --example ocean    # renders ocean.png
 cargo run --release -p qanten-graphics --example crowd    # 100 skinned tentacles + blendshape bench
+cargo run --release -p qanten-graphics --example blendshapes  # morph targets
 cargo run --release -p qanten-graphics --example probes   # bakes 1024 light probes
+cargo run --release -p qanten-graphics --example dct      # JPEG-style compression
 ```
 
 Each example prints NPU-path vs CPU-reference timing and the maximum error.

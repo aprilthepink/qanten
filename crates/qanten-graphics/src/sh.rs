@@ -1,6 +1,8 @@
 //! Order-2 spherical harmonics (9 coefficients) for light-probe baking and
 //! diffuse irradiance.
 //!
+//! ![Spheres lit by SH9 probes baked on the NPU (example `probes`)](https://raw.githubusercontent.com/aprilthepink/qanten/main/docs/images/probes.png)
+//!
 //! Baking projects many radiance samples per probe onto the 9 basis
 //! functions: a `[9, samples]` matrix (basis × solid angle) resident on the
 //! NPU times one row of samples per probe and colour channel. Thousands of
@@ -47,6 +49,7 @@ const BAND: [f32; 9] = [
 /// RGB spherical-harmonic coefficients of one probe.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Sh9 {
+    /// RGB coefficient per basis function, in the order of [`basis`].
     pub coeffs: [Vec3; 9],
 }
 
@@ -126,6 +129,7 @@ impl ShProjector {
         })
     }
 
+    /// Uploads the weighted basis to `npu`; later projections run there.
     pub fn with_npu(mut self, npu: &Npu) -> Result<Self> {
         self.npu = Some(ResidentMatrix::upload(
             npu,

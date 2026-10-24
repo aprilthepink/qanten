@@ -40,6 +40,10 @@ jobs:
           cargo run --release -p qanten-graphics --example ocean -- 128 ocean.png
           cargo run --release -p qanten-graphics --example crowd -- crowd.png
           cargo run --release -p qanten-graphics --example probes -- probes.png
+          cargo run --release -p qanten-graphics --example blendshapes -- blendshapes.png
+          cargo run --release -p qanten-graphics --example dct -- dct.png
+      - name: Doc snippets compile and run
+        run: python3 scripts/check_docs.py
       - run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

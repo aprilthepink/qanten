@@ -16,9 +16,13 @@ use crate::tensor::Tensor;
 /// Parameters of a 2-D convolution (PyTorch semantics, zero padding).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Conv2dParams {
+    /// Step between kernel positions.
     pub stride: Hw,
+    /// Zero padding added on each side.
     pub padding: Hw,
+    /// Spacing between kernel taps (1 = dense).
     pub dilation: Hw,
+    /// Channel groups (equal to the channel count for depthwise).
     pub groups: usize,
 }
 
@@ -34,21 +38,26 @@ impl Default for Conv2dParams {
 }
 
 impl Conv2dParams {
+    /// Stride 1, no padding, dilation 1, one group.
     pub fn new() -> Self {
         Self::default()
     }
+    /// Sets the stride (a `usize` for both axes, or `(h, w)`).
     pub fn stride(mut self, s: impl Into<Hw>) -> Self {
         self.stride = s.into();
         self
     }
+    /// Sets the zero padding.
     pub fn padding(mut self, p: impl Into<Hw>) -> Self {
         self.padding = p.into();
         self
     }
+    /// Sets the dilation.
     pub fn dilation(mut self, d: impl Into<Hw>) -> Self {
         self.dilation = d.into();
         self
     }
+    /// Sets the number of groups.
     pub fn groups(mut self, g: usize) -> Self {
         self.groups = g;
         self
@@ -103,10 +112,15 @@ impl Conv2dParams {
 /// Parameters of a 2-D transposed convolution (PyTorch semantics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConvTranspose2dParams {
+    /// Step between kernel positions.
     pub stride: Hw,
+    /// Zero padding added on each side.
     pub padding: Hw,
+    /// Extra rows/columns added to one side of the output; must be smaller than stride or dilation.
     pub output_padding: Hw,
+    /// Spacing between kernel taps (1 = dense).
     pub dilation: Hw,
+    /// Channel groups (equal to the channel count for depthwise).
     pub groups: usize,
 }
 
@@ -123,25 +137,31 @@ impl Default for ConvTranspose2dParams {
 }
 
 impl ConvTranspose2dParams {
+    /// Stride 1, no padding, dilation 1, one group.
     pub fn new() -> Self {
         Self::default()
     }
+    /// Sets the stride (a `usize` for both axes, or `(h, w)`).
     pub fn stride(mut self, s: impl Into<Hw>) -> Self {
         self.stride = s.into();
         self
     }
+    /// Sets the zero padding.
     pub fn padding(mut self, p: impl Into<Hw>) -> Self {
         self.padding = p.into();
         self
     }
+    /// Sets the output padding.
     pub fn output_padding(mut self, p: impl Into<Hw>) -> Self {
         self.output_padding = p.into();
         self
     }
+    /// Sets the dilation.
     pub fn dilation(mut self, d: impl Into<Hw>) -> Self {
         self.dilation = d.into();
         self
     }
+    /// Sets the number of groups.
     pub fn groups(mut self, g: usize) -> Self {
         self.groups = g;
         self
@@ -229,10 +249,12 @@ impl ConvWeights {
         self.shape
     }
 
+    /// Number of groups the weights were uploaded for.
     pub fn groups(&self) -> usize {
         self.per_group.len()
     }
 
+    /// The NPU holding the weights (`None` only for zero groups, which `upload` rejects).
     pub fn npu(&self) -> Option<&Npu> {
         self.per_group.first().map(LinearWeights::npu)
     }
@@ -316,6 +338,7 @@ impl ConvTransposeWeights {
         self.shape
     }
 
+    /// Number of groups the weights were uploaded for.
     pub fn groups(&self) -> usize {
         self.per_group.len()
     }

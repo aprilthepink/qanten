@@ -1,6 +1,8 @@
 //! Gerstner ocean waves on a grid: displaced positions, normals and a foam
 //! (Jacobian) mask, plus exact height queries for buoyancy.
 //!
+//! ![A 400×400 Gerstner ocean with 64 waves, evaluated as one NPU matrix product (example `ocean`)](https://raw.githubusercontent.com/aprilthepink/qanten/main/docs/images/ocean.png)
+//!
 //! # How it maps to the NPU
 //!
 //! Each wave's phase is `θ = a·x + (b·z + c)` with `a = k·Dx`, `b = k·Dz`,
@@ -45,10 +47,12 @@ pub struct Wave {
 }
 
 impl Wave {
+    /// Wavenumber `k = 2π / wavelength`, in rad/m.
     pub fn wavenumber(&self) -> f64 {
         TAU / self.wavelength as f64
     }
 
+    /// Angular frequency `ω = √(g·k)` (deep water), in rad/s.
     pub fn angular_frequency(&self) -> f64 {
         (GRAVITY * self.wavenumber()).sqrt()
     }
@@ -117,6 +121,7 @@ pub struct Grid {
 }
 
 impl Grid {
+    /// `nx × nz` samples covering `size` metres from `origin` (edges included).
     pub fn new(origin: Vec2, size: Vec2, nx: usize, nz: usize) -> Self {
         Self {
             origin,
@@ -146,7 +151,9 @@ impl Grid {
 /// One evaluated frame. Arrays are row-major over `(z, x)`: index `j * nx + i`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OceanFrame {
+    /// Samples along x.
     pub nx: usize,
+    /// Samples along z.
     pub nz: usize,
     /// Displaced world-space positions.
     pub positions: Vec<Vec3>,
@@ -158,6 +165,7 @@ pub struct OceanFrame {
 }
 
 impl OceanFrame {
+    /// Array index of grid sample `(i, j)` (x index, z index).
     pub fn index(&self, i: usize, j: usize) -> usize {
         j * self.nx + i
     }
@@ -166,8 +174,11 @@ impl OceanFrame {
 /// Exact single-point sample (f64 on the host), see [`GerstnerOcean::sample`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OceanSample {
+    /// Surface height above `y = 0`, in metres.
     pub height: f32,
+    /// Unit surface normal.
     pub normal: Vec3,
+    /// Vertical velocity of the surface, in m/s (positive = rising).
     pub velocity_y: f32,
 }
 
@@ -203,6 +214,7 @@ pub struct GerstnerOcean {
 }
 
 impl GerstnerOcean {
+    /// A CPU-evaluated ocean. Fails on an empty wave list, non-positive wavelengths or an empty grid.
     pub fn new(waves: Vec<Wave>, grid: Grid) -> Result<Self> {
         if waves.is_empty() {
             return Err(Error::InvalidArgument(
@@ -243,14 +255,17 @@ impl GerstnerOcean {
         Ok(self)
     }
 
+    /// The waves.
     pub fn waves(&self) -> &[Wave] {
         &self.waves
     }
 
+    /// The evaluation grid.
     pub fn grid(&self) -> &Grid {
         &self.grid
     }
 
+    /// `true` after [`with_npu`](Self::with_npu).
     pub fn is_accelerated(&self) -> bool {
         self.npu_basis.is_some()
     }

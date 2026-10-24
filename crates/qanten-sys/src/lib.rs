@@ -21,6 +21,7 @@
 //! 3. the absolute paths in [`DEFAULT_LIBRARY_PATHS`].
 
 #![allow(non_camel_case_types)]
+#![warn(missing_docs)]
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 use std::ffi::{CStr, OsStr, OsString, c_char, c_int};
@@ -53,7 +54,9 @@ pub const DEFAULT_LIBRARY_PATHS: &[&str] = &[
 #[repr(C)]
 #[derive(Clone)]
 pub struct QantDriverError {
+    /// Status code: `0` on success, anything else is an error.
     pub code: c_int,
+    /// NUL-terminated error message (empty on success).
     pub message: [c_char; C_STRING_DEFAULT_LENGTH],
 }
 
@@ -78,6 +81,7 @@ impl QantDriverError {
         Self { code, message: buf }
     }
 
+    /// `true` if `code == 0`.
     pub fn is_ok(&self) -> bool {
         self.code == 0
     }
@@ -101,30 +105,51 @@ impl fmt::Debug for QantDriverError {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SensorInfo {
+    /// Temperature sensor `pd1`, in °C.
     pub temp_pd1: f64,
+    /// Temperature sensor `pd2`, in °C.
     pub temp_pd2: f64,
+    /// Temperature sensor `pd3`, in °C.
     pub temp_pd3: f64,
+    /// Temperature sensor `dac_1`, in °C.
     pub temp_dac_1: f64,
+    /// Temperature sensor `dac_2`, in °C.
     pub temp_dac_2: f64,
+    /// Measured voltage of the 1.8 V rail, in V.
     pub voltage_1v8: f64,
+    /// Measured voltage of the 3.3 V rail, in V.
     pub voltage_3v3: f64,
+    /// Measured voltage of the first 6.0 V rail, in V.
     pub voltage_6v0_1: f64,
+    /// Measured voltage of the second 6.0 V rail, in V.
     pub voltage_6v0_2: f64,
+    /// Measured voltage of the 6.2 V rail, in V.
     pub voltage_6v2: f64,
+    /// Measured voltage of the 6.5 V rail, in V.
     pub voltage_6v5: f64,
+    /// Measured voltage of the first 8.0 V rail, in V.
     pub voltage_8v0_1: f64,
+    /// Measured voltage of the second 8.0 V rail, in V.
     pub voltage_8v0_2: f64,
+    /// Measured voltage of the 12 V rail, in V.
     pub voltage_12v: f64,
+    /// Measured voltage of the 12.5 V rail, in V.
     pub voltage_12v5: f64,
+    /// Measured voltage of the −12.5 V rail, in V.
     pub voltage_n12v5: f64,
+    /// Current drawn on the 12 V rail, in A.
     pub current_12v: f64,
 }
 
 #[repr(C)]
 #[derive(Clone)]
+/// Firmware and board identification, as fixed-size C strings.
 pub struct QantVersionInfo {
+    /// Firmware version string.
     pub fw_version: [c_char; C_STRING_DEFAULT_LENGTH],
+    /// Version of the Zephyr RTOS running on the board.
     pub zephyr_version: [c_char; C_STRING_DEFAULT_LENGTH],
+    /// Board serial number.
     pub board_serial_no: [c_char; C_STRING_DEFAULT_LENGTH],
 }
 
@@ -140,9 +165,13 @@ impl fmt::Debug for QantVersionInfo {
 
 #[repr(C)]
 #[derive(Debug, Clone)]
+/// Everything `qant_driver_get_device_info` returns, by value.
 pub struct QantDeviceInfo {
+    /// Board sensor readings.
     pub sensor_info: SensorInfo,
+    /// Firmware and board identification.
     pub version_info: QantVersionInfo,
+    /// Status of the call; the other fields are only valid if this is ok.
     pub error: QantDriverError,
 }
 
@@ -151,7 +180,9 @@ pub struct QantDeviceInfo {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QantDataRole {
+    /// Matrix operand of a matrix-vector product (upload only).
     Weights = 0,
+    /// Vector operands and results (upload and download).
     Features = 1,
 }
 
@@ -159,12 +190,15 @@ pub enum QantDataRole {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct QantDriverHandle {
+    /// NPU the memory lives on.
     pub npu_id: u32,
+    /// Driver-assigned identifier of the memory block.
     pub key: u64,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// Performance counters returned by `qant_driver_get_perf_counter`.
 pub struct PerformanceCounterInfo {
     /// Seconds since the last counter reset.
     pub timebased_counter: f64,
@@ -172,10 +206,14 @@ pub struct PerformanceCounterInfo {
     pub stalling_counter: f64,
 }
 
+/// `qant_driver_init_npu`: initialise an NPU before use.
 pub type InitNpuFn = unsafe extern "C" fn(npu_id: u32) -> QantDriverError;
+/// `qant_driver_release_npu`: release an NPU after use.
 pub type ReleaseNpuFn = unsafe extern "C" fn(npu_id: u32) -> QantDriverError;
+/// `qant_driver_setup_logging`: write driver logs to a folder (level 0 = trace … 4 = error).
 pub type SetupLoggingFn =
     unsafe extern "C" fn(folder_name: *const c_char, loglevel: i32) -> QantDriverError;
+/// `qant_driver_mul_npu`: elementwise `output[i] = us[i] · vs[i]` for `len` values.
 pub type MulNpuFn = unsafe extern "C" fn(
     npu_id: u32,
     us: *const bf16,
@@ -183,6 +221,7 @@ pub type MulNpuFn = unsafe extern "C" fn(
     output: *mut bf16,
     len: usize,
 ) -> QantDriverError;
+/// `qant_driver_mul_matrix_vec_batched`: `output[v, r] = Σ_c matrix[r, c] · vector_batch[v, c]`.
 pub type MulMatrixVecBatchedFn = unsafe extern "C" fn(
     npu_id: u32,
     matrix: *const bf16,
@@ -192,7 +231,9 @@ pub type MulMatrixVecBatchedFn = unsafe extern "C" fn(
     n_cols: usize,
     n_vecs: usize,
 ) -> QantDriverError;
+/// `qant_driver_scaled_periodic_nl_npu`: the photonic nonlinearity `output[i] = tcos(us[i]) · vs[i]`.
 pub type ScaledPeriodicNlFn = MulNpuFn;
+/// `qant_driver_allocate`: reserve a `rows × cols` bf16 block in device memory.
 pub type AllocateFn = unsafe extern "C" fn(
     npu_id: u32,
     rows: usize,
@@ -200,26 +241,35 @@ pub type AllocateFn = unsafe extern "C" fn(
     data_role: QantDataRole,
     out_handle: *mut QantDriverHandle,
 ) -> QantDriverError;
+/// `qant_driver_free`: release a block from `AllocateFn`.
 pub type FreeFn = unsafe extern "C" fn(handle: QantDriverHandle) -> QantDriverError;
+/// `qant_driver_upload`: copy `rows · cols` values from host memory into a block.
 pub type UploadFn =
     unsafe extern "C" fn(handle: QantDriverHandle, data: *const bf16) -> QantDriverError;
+/// `qant_driver_download`: copy a `Features` block (`rows · cols` values) back to the host.
 pub type DownloadFn =
     unsafe extern "C" fn(handle: QantDriverHandle, output: *mut bf16) -> QantDriverError;
+/// `qant_driver_mul_matrix_vec_batched_mem`: matrix-vector product with all operands resident on the device.
 pub type MulMatrixVecBatchedMemFn = unsafe extern "C" fn(
     matrix: QantDriverHandle,
     vectors: QantDriverHandle,
     result: QantDriverHandle,
 ) -> QantDriverError;
+/// `qant_driver_get_version`: write the driver version string (NUL-terminated) into `output`.
 pub type GetVersionFn =
     unsafe extern "C" fn(npu_id: u32, output: *mut c_char, len: usize) -> QantDriverError;
+/// `qant_driver_get_device_info`: sensor readings and version info, returned by value.
 pub type GetDeviceInfoFn = unsafe extern "C" fn(npu_id: u32) -> QantDeviceInfo;
+/// `qant_driver_get_available_npus`: fill up to `capacity` NPU ids and serial numbers.
 pub type GetAvailableNpusFn = unsafe extern "C" fn(
     idxs_out: *mut u32,
     serials_out: *mut [c_char; C_STRING_DEFAULT_LENGTH],
     capacity: usize,
     out_count: *mut usize,
 ) -> QantDriverError;
+/// `qant_driver_reset_perf_counter`: restart the performance counters.
 pub type ResetPerfCounterFn = unsafe extern "C" fn(npu_id: u32) -> QantDriverError;
+/// `qant_driver_get_perf_counter`: read the performance counters.
 pub type GetPerfCounterFn =
     unsafe extern "C" fn(npu_id: u32, out: *mut PerformanceCounterInfo) -> QantDriverError;
 
@@ -230,8 +280,11 @@ pub enum LoadError {
     NotFound(Vec<(OsString, libloading::Error)>),
     /// The library opened but a required symbol is missing (driver too old?).
     MissingSymbol {
+        /// Library that was opened.
         path: OsString,
+        /// Name of the missing symbol.
         symbol: &'static str,
+        /// Loader error.
         source: libloading::Error,
     },
 }
@@ -280,21 +333,37 @@ impl std::error::Error for LoadError {
 /// because it owns the [`libloading::Library`].
 pub struct DriverLibrary {
     path: OsString,
+    /// See [`InitNpuFn`].
     pub init_npu: InitNpuFn,
+    /// See [`ReleaseNpuFn`].
     pub release_npu: ReleaseNpuFn,
+    /// See [`SetupLoggingFn`].
     pub setup_logging: SetupLoggingFn,
+    /// See [`MulNpuFn`].
     pub mul_npu: MulNpuFn,
+    /// See [`MulMatrixVecBatchedFn`].
     pub mul_matrix_vec_batched: MulMatrixVecBatchedFn,
+    /// See [`ScaledPeriodicNlFn`].
     pub scaled_periodic_nl_npu: ScaledPeriodicNlFn,
+    /// See [`AllocateFn`].
     pub allocate: AllocateFn,
+    /// See [`FreeFn`].
     pub free: FreeFn,
+    /// See [`UploadFn`].
     pub upload: UploadFn,
+    /// See [`DownloadFn`].
     pub download: DownloadFn,
+    /// See [`MulMatrixVecBatchedMemFn`].
     pub mul_matrix_vec_batched_mem: MulMatrixVecBatchedMemFn,
+    /// See [`GetVersionFn`].
     pub get_version: GetVersionFn,
+    /// See [`GetDeviceInfoFn`].
     pub get_device_info: GetDeviceInfoFn,
+    /// See [`GetAvailableNpusFn`].
     pub get_available_npus: GetAvailableNpusFn,
+    /// See [`ResetPerfCounterFn`].
     pub reset_perf_counter: ResetPerfCounterFn,
+    /// See [`GetPerfCounterFn`].
     pub get_perf_counter: GetPerfCounterFn,
     // Must be dropped last; keeps the function pointers above valid.
     _lib: libloading::Library,

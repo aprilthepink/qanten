@@ -10,15 +10,18 @@ use crate::tensor::Tensor;
 /// Parameters of max / average pooling (PyTorch semantics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pool2dParams {
+    /// Window size.
     pub kernel: Hw,
     /// Defaults to the kernel size.
     pub stride: Hw,
+    /// Implicit padding on each side (at most half the kernel).
     pub padding: Hw,
     /// Average pooling only: count padded zeros in the divisor (PyTorch default `true`).
     pub count_include_pad: bool,
 }
 
 impl Pool2dParams {
+    /// A `kernel`-sized window with stride equal to the kernel and no padding.
     pub fn new(kernel: impl Into<Hw>) -> Self {
         let kernel = kernel.into();
         Self {
@@ -28,14 +31,17 @@ impl Pool2dParams {
             count_include_pad: true,
         }
     }
+    /// Sets the stride.
     pub fn stride(mut self, s: impl Into<Hw>) -> Self {
         self.stride = s.into();
         self
     }
+    /// Sets the padding.
     pub fn padding(mut self, p: impl Into<Hw>) -> Self {
         self.padding = p.into();
         self
     }
+    /// Average pooling only: whether padded zeros count in the divisor.
     pub fn count_include_pad(mut self, yes: bool) -> Self {
         self.count_include_pad = yes;
         self

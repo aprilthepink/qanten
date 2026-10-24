@@ -6,22 +6,39 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct SensorReadings {
+    /// Temperature sensor `pd1`, in °C.
     pub temp_pd1: f64,
+    /// Temperature sensor `pd2`, in °C.
     pub temp_pd2: f64,
+    /// Temperature sensor `pd3`, in °C.
     pub temp_pd3: f64,
+    /// Temperature sensor `dac_1`, in °C.
     pub temp_dac_1: f64,
+    /// Temperature sensor `dac_2`, in °C.
     pub temp_dac_2: f64,
+    /// Measured voltage of the 1.8 V rail, in V.
     pub voltage_1v8: f64,
+    /// Measured voltage of the 3.3 V rail, in V.
     pub voltage_3v3: f64,
+    /// Measured voltage of the first 6.0 V rail, in V.
     pub voltage_6v0_1: f64,
+    /// Measured voltage of the second 6.0 V rail, in V.
     pub voltage_6v0_2: f64,
+    /// Measured voltage of the 6.2 V rail, in V.
     pub voltage_6v2: f64,
+    /// Measured voltage of the 6.5 V rail, in V.
     pub voltage_6v5: f64,
+    /// Measured voltage of the first 8.0 V rail, in V.
     pub voltage_8v0_1: f64,
+    /// Measured voltage of the second 8.0 V rail, in V.
     pub voltage_8v0_2: f64,
+    /// Measured voltage of the 12 V rail, in V.
     pub voltage_12v: f64,
+    /// Measured voltage of the 12.5 V rail, in V.
     pub voltage_12v5: f64,
+    /// Measured voltage of the −12.5 V rail, in V.
     pub voltage_n12v5: f64,
+    /// Current drawn on the 12 V rail, in A.
     pub current_12v: f64,
 }
 
@@ -59,8 +76,11 @@ impl SensorReadings {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct VersionInfo {
+    /// Firmware version.
     pub firmware: String,
+    /// Version of the Zephyr RTOS on the board.
     pub zephyr: String,
+    /// Board serial number.
     pub board_serial: String,
 }
 
@@ -68,7 +88,9 @@ pub struct VersionInfo {
 #[derive(Debug, Clone, Default, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct DeviceInfo {
+    /// Board sensor readings.
     pub sensors: SensorReadings,
+    /// Firmware and board identification.
     pub version: VersionInfo,
 }
 

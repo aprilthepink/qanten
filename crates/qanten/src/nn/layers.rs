@@ -48,10 +48,12 @@ impl Linear {
         )
     }
 
+    /// Input size.
     pub fn in_features(&self) -> usize {
         self.weights.in_features()
     }
 
+    /// Output size.
     pub fn out_features(&self) -> usize {
         self.weights.out_features()
     }
@@ -103,6 +105,7 @@ impl Conv2d {
         )
     }
 
+    /// Stride, padding, dilation and groups.
     pub fn params(&self) -> &Conv2dParams {
         &self.params
     }
@@ -144,6 +147,7 @@ impl ConvTranspose2d {
         })
     }
 
+    /// Loads `{prefix}.weight` and optional `{prefix}.bias`.
     pub fn load(
         npu: &Npu,
         sd: &StateDict,
@@ -184,6 +188,7 @@ pub struct BatchNorm2d {
 }
 
 impl BatchNorm2d {
+    /// Batch norm with running statistics and optional scale (`weight`) and shift (`bias`).
     pub fn new(
         npu: &Npu,
         running_mean: Tensor,
@@ -236,12 +241,16 @@ impl Module for BatchNorm2d {
 /// Layer normalisation over the last dimension.
 #[derive(Debug, Clone)]
 pub struct LayerNorm {
+    /// Per-feature scale (`γ`), if any.
     pub weight: Option<Tensor>,
+    /// Per-feature shift (`β`), if any.
     pub bias: Option<Tensor>,
+    /// Added to the variance for numerical stability.
     pub eps: f32,
 }
 
 impl LayerNorm {
+    /// Loads optional `{prefix}.weight` and `{prefix}.bias`.
     pub fn load(sd: &StateDict, prefix: &str, eps: f32) -> Self {
         Self {
             weight: sd.get_opt(&key(prefix, "weight")).cloned(),
@@ -264,12 +273,16 @@ impl Module for LayerNorm {
 #[derive(Debug)]
 pub struct Kan {
     npu: Npu,
+    /// Phase offsets, `[out, in, n_k]`.
     pub phis: Tensor,
+    /// Amplitudes, `[out, in, n_k]`.
     pub ampls: Tensor,
+    /// Frequencies, `[n_k]`.
     pub ks: Tensor,
 }
 
 impl Kan {
+    /// A KAN layer on `npu` (shapes as in [`ops::kan_layer`]).
     pub fn new(npu: &Npu, phis: Tensor, ampls: Tensor, ks: Tensor) -> Self {
         Self {
             npu: npu.clone(),
@@ -304,6 +317,7 @@ impl Module for Kan {
 pub struct MaxPool2d(pub Pool2dParams);
 
 impl MaxPool2d {
+    /// Square or `(h, w)` window, stride equal to the window.
     pub fn new(kernel: impl Into<Hw>) -> Self {
         Self(Pool2dParams::new(kernel))
     }
@@ -323,6 +337,7 @@ impl Module for MaxPool2d {
 pub struct AvgPool2d(pub Pool2dParams);
 
 impl AvgPool2d {
+    /// Square or `(h, w)` window, stride equal to the window.
     pub fn new(kernel: impl Into<Hw>) -> Self {
         Self(Pool2dParams::new(kernel))
     }
@@ -342,6 +357,7 @@ impl Module for AvgPool2d {
 pub struct AdaptiveAvgPool2d(pub Hw);
 
 impl AdaptiveAvgPool2d {
+    /// Pools to an `output` (height, width).
     pub fn new(output: impl Into<Hw>) -> Self {
         Self(output.into())
     }
@@ -359,6 +375,7 @@ impl Module for AdaptiveAvgPool2d {
 /// Flattens dimensions from `start_dim` on (PyTorch default: 1).
 #[derive(Debug, Clone, Copy)]
 pub struct Flatten {
+    /// First dimension to flatten.
     pub start_dim: usize,
 }
 
@@ -443,6 +460,7 @@ impl<F> Lambda<F>
 where
     F: Fn(&Tensor) -> Result<Tensor> + Send + Sync,
 {
+    /// Wraps `f`; `name` shows up in debug output.
     pub fn new(name: &'static str, f: F) -> Self {
         Self { name, f }
     }

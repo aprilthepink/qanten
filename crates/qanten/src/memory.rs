@@ -27,6 +27,7 @@ mod sealed {
 
 /// Marker trait for [`Weights`] and [`Features`].
 pub trait Role: sealed::Sealed + Send + Sync + 'static {
+    /// The runtime role this marker stands for.
     const ROLE: DataRole;
 }
 
@@ -111,14 +112,17 @@ impl<R: Role> DeviceBuffer<R> {
         self.npu.backend().upload(self.raw, data)
     }
 
+    /// Number of rows.
     pub fn rows(&self) -> usize {
         self.rows
     }
 
+    /// Number of columns.
     pub fn cols(&self) -> usize {
         self.cols
     }
 
+    /// The NPU this block lives on.
     pub fn npu(&self) -> &Npu {
         &self.npu
     }

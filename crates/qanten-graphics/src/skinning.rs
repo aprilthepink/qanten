@@ -2,6 +2,8 @@
 //! meshes engines need for collision, ray picking, cloth attachment, or
 //! audio occlusion.
 //!
+//! ![100 tentacles skinned in one NPU call (example `crowd`)](https://raw.githubusercontent.com/aprilthepink/qanten/main/docs/images/crowd.png)
+//!
 //! # Formulation
 //!
 //! Skinning is `v' = Σ_b w_vb · M_b · (v, 1)`. Written as an offset from the
@@ -28,7 +30,9 @@ pub type Influences = [(u16, f32); 4];
 /// Skinned positions (and normals, if the mesh has them) of one or more characters.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Skinned {
+    /// Skinned positions, `characters × vertices`.
     pub positions: Vec<Vec3>,
+    /// Skinned unit normals (empty if the mesh has none).
     pub normals: Vec<Vec3>,
 }
 
@@ -120,10 +124,12 @@ impl SkinnedMesh {
         Ok(self)
     }
 
+    /// Vertices in the mesh.
     pub fn vertex_count(&self) -> usize {
         self.rest.len()
     }
 
+    /// Bones in the skeleton.
     pub fn bone_count(&self) -> usize {
         self.bones
     }

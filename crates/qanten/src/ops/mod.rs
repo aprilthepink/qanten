@@ -35,11 +35,14 @@ pub use pool::{
 /// square value, or from a tuple.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Hw {
+    /// Height (rows).
     pub h: usize,
+    /// Width (columns).
     pub w: usize,
 }
 
 impl Hw {
+    /// A `(height, width)` pair.
     pub const fn new(h: usize, w: usize) -> Self {
         Self { h, w }
     }

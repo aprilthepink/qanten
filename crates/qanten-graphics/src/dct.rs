@@ -1,6 +1,8 @@
 //! 8×8 block DCT-II (the transform behind JPEG and many texture and video
 //! codecs) for image and asset pipelines.
 //!
+//! ![Original, JPEG quality 50 and quality 10 via the NPU DCT (example `dct`)](https://raw.githubusercontent.com/aprilthepink/qanten/main/docs/images/dct.png)
+//!
 //! Each 8×8 block is a 64-vector; the 2-D DCT is one 64×64 matrix (the
 //! Kronecker product of two 1-D DCTs), resident on the NPU. All blocks of
 //! an image go through in one call.
@@ -26,6 +28,7 @@ impl Default for Dct8x8 {
 }
 
 impl Dct8x8 {
+    /// Builds the forward and inverse 64×64 matrices (CPU only until [`with_npu`](Self::with_npu)).
     pub fn new() -> Self {
         let c = |u: usize, x: usize| -> f64 {
             let a = if u == 0 {
@@ -55,6 +58,7 @@ impl Dct8x8 {
         }
     }
 
+    /// Uploads both matrices to `npu`; later calls run there.
     pub fn with_npu(mut self, npu: &Npu) -> Result<Self> {
         self.npu = Some((
             ResidentMatrix::upload(npu, &self.forward, 64, 64)?,

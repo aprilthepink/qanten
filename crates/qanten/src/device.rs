@@ -170,10 +170,12 @@ impl Npu {
         &self.inner.backend
     }
 
+    /// Which kind of backend this NPU runs on.
     pub fn backend_kind(&self) -> BackendKind {
         self.inner.backend.kind()
     }
 
+    /// `true` if this NPU is the built-in simulator.
     pub fn is_simulated(&self) -> bool {
         self.backend_kind() == BackendKind::Simulator
     }
@@ -187,18 +189,22 @@ impl Npu {
             )
     }
 
+    /// Current sensor readings and firmware info.
     pub fn device_info(&self) -> Result<DeviceInfo> {
         self.inner.backend.device_info(self.id())
     }
 
+    /// Driver version string.
     pub fn driver_version(&self) -> Result<String> {
         self.inner.backend.driver_version(self.id())
     }
 
+    /// Performance counters since the last reset.
     pub fn perf_counters(&self) -> Result<PerfCounters> {
         self.inner.backend.perf_counters(self.id())
     }
 
+    /// Restarts the performance counters.
     pub fn reset_perf_counters(&self) -> Result<()> {
         self.inner.backend.reset_perf_counters(self.id())
     }

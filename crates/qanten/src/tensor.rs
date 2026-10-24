@@ -102,6 +102,7 @@ impl Tensor {
         self.data.len()
     }
 
+    /// `true` if the tensor has no elements.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }

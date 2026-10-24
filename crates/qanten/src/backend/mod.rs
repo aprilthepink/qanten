@@ -59,7 +59,9 @@ pub enum DataRole {
 /// Backend-specific identifier for a device memory block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RawHandle {
+    /// NPU the memory lives on.
     pub npu: u32,
+    /// Backend-assigned identifier of the block.
     pub key: u64,
 }
 
@@ -67,7 +69,9 @@ pub struct RawHandle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct NpuEntry {
+    /// Index to pass to [`Npu::open`](crate::Npu::open).
     pub id: u32,
+    /// Board serial number.
     pub serial: String,
 }
 
@@ -76,13 +80,17 @@ pub struct NpuEntry {
 /// Implementations must check slice lengths themselves: callers may pass
 /// any slices. All methods are safe to call from several threads at once.
 pub trait Backend: Send + Sync + std::fmt::Debug {
+    /// Which kind of backend this is.
     fn kind(&self) -> BackendKind;
 
     /// Human readable backend name, e.g. the driver library path.
     fn name(&self) -> String;
 
+    /// Prepares NPU `npu` for use. Called once by [`Npu::with_backend`](crate::Npu::with_backend).
     fn init_npu(&self, npu: u32) -> Result<()>;
+    /// Releases NPU `npu`. Called when the last [`Npu`](crate::Npu) handle drops.
     fn release_npu(&self, npu: u32) -> Result<()>;
+    /// Lists the NPUs this backend can open.
     fn available_npus(&self) -> Result<Vec<NpuEntry>>;
 
     /// `out[i] = a[i] * b[i]`. All three slices have the same length.
@@ -104,7 +112,9 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
         cols: usize,
     ) -> Result<()>;
 
+    /// Reserves a `rows × cols` block of device memory.
     fn allocate(&self, npu: u32, rows: usize, cols: usize, role: DataRole) -> Result<RawHandle>;
+    /// Releases a block. Freeing twice must return an error, not crash.
     fn free(&self, handle: RawHandle) -> Result<()>;
     /// Uploads exactly `rows * cols` values into `handle`.
     fn upload(&self, handle: RawHandle, data: &[bf16]) -> Result<()>;
@@ -118,9 +128,13 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
         result: RawHandle,
     ) -> Result<()>;
 
+    /// Driver version string.
     fn driver_version(&self, npu: u32) -> Result<String>;
+    /// Sensor readings and firmware info.
     fn device_info(&self, npu: u32) -> Result<DeviceInfo>;
+    /// Performance counters since the last reset.
     fn perf_counters(&self, npu: u32) -> Result<PerfCounters>;
+    /// Restarts the performance counters.
     fn reset_perf_counters(&self, npu: u32) -> Result<()>;
 }
 

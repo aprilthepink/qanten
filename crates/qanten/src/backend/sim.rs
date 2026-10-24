@@ -84,6 +84,7 @@ impl Default for Simulator {
 }
 
 impl Simulator {
+    /// A simulator with the given settings.
     pub fn new(config: SimConfig) -> Self {
         let rng = SplitMix64::new(config.seed);
         Self {
@@ -95,6 +96,7 @@ impl Simulator {
         }
     }
 
+    /// The settings this simulator was created with.
     pub fn config(&self) -> &SimConfig {
         &self.config
     }

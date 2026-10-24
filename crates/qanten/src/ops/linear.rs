@@ -93,14 +93,17 @@ impl LinearWeights {
         })
     }
 
+    /// Output size (matrix rows).
     pub fn out_features(&self) -> usize {
         self.buffer.rows()
     }
 
+    /// Input size (matrix columns).
     pub fn in_features(&self) -> usize {
         self.buffer.cols()
     }
 
+    /// The NPU holding the weights.
     pub fn npu(&self) -> &Npu {
         self.buffer.npu()
     }

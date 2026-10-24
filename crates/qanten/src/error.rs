@@ -9,8 +9,11 @@ pub enum Error {
     /// The driver (or simulator) rejected an operation.
     #[error("NPU {npu}: driver error {code}: {message}")]
     Driver {
+        /// NPU the failing call was made on.
         npu: u32,
+        /// Driver status code.
         code: i32,
+        /// Driver error message.
         message: String,
     },
 
@@ -47,6 +50,7 @@ pub enum Error {
     Format(String),
 
     #[error(transparent)]
+    /// File system error (e.g. reading a weights file).
     Io(#[from] std::io::Error),
 }
 

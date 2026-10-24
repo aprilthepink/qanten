@@ -36,6 +36,7 @@
 //! This is an unofficial community crate and is not affiliated with Q.ANT GmbH.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![warn(missing_docs)]
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod backend;

@@ -10,10 +10,12 @@ pub struct StateDict {
 }
 
 impl StateDict {
+    /// An empty state dict.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Adds or replaces a tensor; returns the previous one.
     pub fn insert(&mut self, name: impl Into<String>, tensor: Tensor) -> Option<Tensor> {
         self.tensors.insert(name.into(), tensor)
     }
@@ -25,30 +27,37 @@ impl StateDict {
             .ok_or_else(|| Error::MissingTensor(name.to_owned()))
     }
 
+    /// The tensor called `name`, if present.
     pub fn get_opt(&self, name: &str) -> Option<&Tensor> {
         self.tensors.get(name)
     }
 
+    /// Removes and returns a tensor.
     pub fn remove(&mut self, name: &str) -> Option<Tensor> {
         self.tensors.remove(name)
     }
 
+    /// `true` if a tensor called `name` exists.
     pub fn contains(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
     }
 
+    /// All tensor names, sorted.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.tensors.keys().map(String::as_str)
     }
 
+    /// All `(name, tensor)` pairs, sorted by name.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Tensor)> {
         self.tensors.iter().map(|(k, v)| (k.as_str(), v))
     }
 
+    /// Number of tensors.
     pub fn len(&self) -> usize {
         self.tensors.len()
     }
 
+    /// `true` if there are no tensors.
     pub fn is_empty(&self) -> bool {
         self.tensors.is_empty()
     }
