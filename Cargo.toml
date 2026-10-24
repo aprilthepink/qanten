@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/qanten-sys", "crates/qanten", "crates/qanten-cli", "crates/qanten-graphics", "crates/qanten-mock-driver"]
+members = ["crates/qanten-sys", "crates/qanten", "crates/qanten-cli", "crates/qanten-graphics", "crates/qanten-serve", "crates/qanten-mock-driver"]
 
 [workspace.package]
 version = "0.1.0"
@@ -30,6 +30,9 @@ anyhow = "1"
 glam = "0.34"
 miniz_oxide = "0.8"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 png = "0.18"
 

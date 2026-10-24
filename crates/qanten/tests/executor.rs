@@ -77,3 +77,15 @@ fn drop_finishes_queued_jobs() {
     let sum: i32 = jobs.into_iter().map(|j| j.wait().unwrap()).sum();
     assert_eq!(sum, 45);
 }
+
+#[test]
+fn concurrent_jobs_spread_evenly_even_when_tiny() {
+    // Tiny jobs used to stay on one worker (whoever re-grabbed the shared queue first).
+    let pool = NpuPool::simulated(2).unwrap();
+    let exec = NpuExecutor::for_pool(&pool);
+    let jobs: Vec<_> = (0..20).map(|_| exec.run(|npu| Ok(npu.id()))).collect();
+    let ids: Vec<u32> = jobs.into_iter().map(|j| j.wait().unwrap()).collect();
+    let on_first = ids.iter().filter(|&&i| i == 0).count();
+    assert!((5..=15).contains(&on_first), "unbalanced: {ids:?}");
+    assert_eq!(exec.queue_depths(), vec![0, 0]);
+}

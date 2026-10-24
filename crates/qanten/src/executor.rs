@@ -18,14 +18,15 @@
 //! # Ok(()) }
 //! ```
 //!
-//! With a pool, every NPU gets a worker and jobs go to whichever is free, so
-//! independent requests spread across all cards. For models, see
+//! With a pool, every NPU gets a worker and each job goes to the worker with
+//! the fewest jobs in flight, so independent requests spread across all cards. For models, see
 //! [`NpuExecutor::forward`].
 
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle as ThreadHandle;
@@ -42,13 +43,24 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// One worker thread with its own queue.
+#[derive(Debug)]
+struct Worker {
+    sender: Option<Sender<Job>>,
+    /// Jobs queued or running on this worker.
+    in_flight: Arc<AtomicUsize>,
+    thread: Option<ThreadHandle<()>>,
+}
+
 /// Worker threads that run NPU work in the background.
 ///
-/// Dropping the executor finishes the queued jobs, then stops the workers.
+/// Each job goes to the worker with the fewest jobs queued or running
+/// (round-robin among equals), so concurrent jobs spread over all NPUs of a
+/// pool. Dropping the executor finishes the queued jobs, then stops the workers.
 #[derive(Debug)]
 pub struct NpuExecutor {
-    sender: Option<Sender<Job>>,
-    workers: Vec<ThreadHandle<()>>,
+    workers: Vec<Worker>,
+    next: AtomicUsize,
 }
 
 impl NpuExecutor {
@@ -57,7 +69,7 @@ impl NpuExecutor {
         Self::with_npus(vec![npu])
     }
 
-    /// One worker per NPU of `pool`; jobs go to the first free worker.
+    /// One worker per NPU of `pool`; each job goes to the least busy one.
     pub fn for_pool(pool: &NpuPool) -> Self {
         Self::with_npus(pool.npus().to_vec())
     }
@@ -69,37 +81,38 @@ impl NpuExecutor {
     }
 
     fn with_npus(npus: Vec<Npu>) -> Self {
-        let (sender, receiver) = mpsc::channel::<Job>();
-        let receiver = Arc::new(Mutex::new(receiver));
         let workers = npus
             .into_iter()
             .enumerate()
-            .map(|(i, npu)| {
-                let rx: Arc<Mutex<Receiver<Job>>> = Arc::clone(&receiver);
-                std::thread::Builder::new()
+            .filter_map(|(i, npu)| {
+                let (sender, receiver) = mpsc::channel::<Job>();
+                let in_flight = Arc::new(AtomicUsize::new(0));
+                let counter = Arc::clone(&in_flight);
+                let thread = std::thread::Builder::new()
                     .name(format!("qanten-npu-{i}"))
                     .spawn(move || {
-                        loop {
-                            // Hold the lock only while receiving, not while running the job.
-                            let job = lock(&rx).recv();
-                            match job {
-                                Ok(job) => job(&npu),
-                                Err(_) => break, // executor dropped
-                            }
+                        // Ends when the executor drops its sender (after draining the queue).
+                        for job in receiver {
+                            job(&npu);
+                            counter.fetch_sub(1, Ordering::AcqRel);
                         }
-                    })
-            })
-            .filter_map(|r| match r {
-                Ok(h) => Some(h),
-                Err(err) => {
-                    tracing::error!(%err, "failed to start NPU worker thread");
-                    None
+                    });
+                match thread {
+                    Ok(t) => Some(Worker {
+                        sender: Some(sender),
+                        in_flight,
+                        thread: Some(t),
+                    }),
+                    Err(err) => {
+                        tracing::error!(%err, "failed to start NPU worker thread");
+                        None
+                    }
                 }
             })
             .collect();
         Self {
-            sender: Some(sender),
             workers,
+            next: AtomicUsize::new(0),
         }
     }
 
@@ -108,8 +121,16 @@ impl NpuExecutor {
         self.workers.len()
     }
 
-    /// Runs `f` on a worker with that worker's NPU. A panic inside `f` is
-    /// caught and returned as an error instead of killing the worker.
+    /// Jobs queued or running, per worker (in pool order).
+    pub fn queue_depths(&self) -> Vec<usize> {
+        self.workers
+            .iter()
+            .map(|w| w.in_flight.load(Ordering::Acquire))
+            .collect()
+    }
+
+    /// Runs `f` on the least busy worker with that worker's NPU. A panic
+    /// inside `f` is caught and returned as an error instead of killing the worker.
     pub fn run<T, F>(&self, f: F) -> JobHandle<T>
     where
         T: Send + 'static,
@@ -123,10 +144,26 @@ impl NpuExecutor {
             });
             done.complete(result);
         });
-        let sent = self.sender.as_ref().map(|s| s.send(job));
-        if !matches!(sent, Some(Ok(()))) || self.workers.is_empty() {
+        let n = self.workers.len();
+        if n == 0 {
             slot.complete(Err(Error::Unsupported(
                 "executor has no running workers".into(),
+            )));
+            return JobHandle { slot };
+        }
+        // Least busy worker, starting the scan at a rotating offset to break ties.
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let pick = (0..n)
+            .map(|k| (start + k) % n)
+            .min_by_key(|&i| self.workers[i].in_flight.load(Ordering::Acquire))
+            .unwrap_or(0);
+        let w = &self.workers[pick];
+        w.in_flight.fetch_add(1, Ordering::AcqRel);
+        let sent = w.sender.as_ref().map(|s| s.send(job));
+        if !matches!(sent, Some(Ok(()))) {
+            w.in_flight.fetch_sub(1, Ordering::AcqRel);
+            slot.complete(Err(Error::Unsupported(
+                "executor worker has stopped".into(),
             )));
         }
         JobHandle { slot }
@@ -145,9 +182,14 @@ impl NpuExecutor {
 
 impl Drop for NpuExecutor {
     fn drop(&mut self) {
-        self.sender.take(); // closes the queue; workers exit after draining it
-        for w in self.workers.drain(..) {
-            let _ = w.join();
+        // Closing every queue lets the workers drain their jobs and exit.
+        for w in &mut self.workers {
+            w.sender.take();
+        }
+        for w in &mut self.workers {
+            if let Some(t) = w.thread.take() {
+                let _ = t.join();
+            }
         }
     }
 }

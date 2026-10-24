@@ -71,73 +71,28 @@ pub fn inspect(path: &Path, npu: &Npu) -> Result<()> {
     Ok(())
 }
 
-/// Builds an MLP from a weights file: every 2-D tensor is a layer `[out, in]`,
-/// ordered by the first number in its name (`0.weight`, `fc1.weight`,
-/// `l1_w`, …); its bias is the matching `.bias` / `_b` / `bias` tensor if
-/// present. Returns the model and its input size.
 fn mlp_from_state_dict(
     npu: &Npu,
     sd: &StateDict,
     act: Activation,
 ) -> Result<(nn::Sequential, usize)> {
-    let number = |k: &str| -> Option<usize> {
-        let digits: String = k
-            .chars()
-            .skip_while(|c| !c.is_ascii_digit())
-            .take_while(char::is_ascii_digit)
-            .collect();
-        digits.parse().ok()
+    let kind = match act {
+        Activation::Relu => nn::ActivationKind::Relu,
+        Activation::Tanh => nn::ActivationKind::Tanh,
+        Activation::Sigmoid => nn::ActivationKind::Sigmoid,
+        Activation::Gelu => nn::ActivationKind::Gelu,
     };
-    let mut layers: Vec<(usize, String)> = sd
-        .iter()
-        .filter(|(_, t)| t.rank() == 2)
-        .filter_map(|(k, _)| Some((number(k)?, k.to_owned())))
-        .collect();
-    layers.sort();
-    if layers.is_empty() {
-        bail!("no numbered 2-D weight matrices found (expected names like `0.weight` or `l1_w`)");
-    }
-    let bias_of = |w: &str| -> Option<Tensor> {
-        [
-            w.replace(".weight", ".bias"),
-            w.replace("_w", "_b"),
-            w.replace("weight", "bias"),
-        ]
-        .iter()
-        .filter(|b| b.as_str() != w)
-        .find_map(|b| sd.get_opt(b).cloned())
-    };
-    let mut model = nn::Sequential::new();
-    let mut prev_out = None;
-    for (i, (_, name)) in layers.iter().enumerate() {
-        let w = sd.get(name)?;
-        let [out, inp] = [w.shape()[0], w.shape()[1]];
-        if let Some(p) = prev_out
-            && p != inp
-        {
-            bail!("layer `{name}` expects {inp} inputs but the previous layer has {p} outputs");
-        }
-        prev_out = Some(out);
+    let (model, info) = nn::mlp_from_state_dict(npu, sd, kind)?;
+    for (i, l) in info.iter().enumerate() {
         println!(
-            "  layer {i}: {name} [{out}, {inp}]{}",
-            if bias_of(name).is_some() {
-                " + bias"
-            } else {
-                ""
-            }
+            "  layer {i}: {} [{}, {}]{}",
+            l.weight,
+            l.out_features,
+            l.in_features,
+            if l.has_bias { " + bias" } else { "" }
         );
-        model.push(nn::Linear::new(npu, w, bias_of(name))?);
-        if i + 1 < layers.len() {
-            match act {
-                Activation::Relu => model.push(nn::ReLU),
-                Activation::Tanh => model.push(nn::Tanh),
-                Activation::Sigmoid => model.push(nn::Sigmoid),
-                Activation::Gelu => model.push(nn::Gelu),
-            }
-        }
     }
-    let in_features = sd.get(&layers[0].1)?.shape()[1];
-    Ok((model, in_features))
+    Ok((model, info[0].in_features))
 }
 
 fn parse_inputs(specs: &[String]) -> Result<Vec<(Option<String>, Tensor)>> {

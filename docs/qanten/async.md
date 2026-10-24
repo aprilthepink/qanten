@@ -48,7 +48,7 @@ async fn main() -> qanten::Result<()> {
 | Item | Purpose |
 |---|---|
 | `NpuExecutor::new(npu)` | one worker thread for one NPU |
-| `NpuExecutor::for_pool(&pool)` | one worker per NPU of an [`NpuPool`](scaling.md); each job goes to the first free worker |
+| `NpuExecutor::for_pool(&pool)` | one worker per NPU of an [`NpuPool`](scaling.md); each job goes to the worker with the fewest jobs queued or running |
 | `NpuExecutor::with_workers(npu, n)` | `n` workers sharing one NPU (overlap host-side work with NPU calls) |
 | `exec.run(\|npu\| ...)` | run any closure on a worker with that worker's NPU → `JobHandle<T>` |
 | `exec.forward(&Arc<model>, x)` | run `model.forward(x)` in the background |
@@ -60,7 +60,7 @@ async fn main() -> qanten::Result<()> {
 - **Panics** inside a job are caught and returned as an error; the worker keeps running.
 - **Dropping** the executor finishes every queued job, then stops the workers, so
   handles you still hold always complete.
-- **Pools**: with `for_pool`, a job runs on whichever NPU is free, so build models
+- **Pools**: with `for_pool`, a job runs on the least busy NPU, so build models
   that live on *every* NPU (e.g. `pool.replicate(...)`) or pick the NPU inside the
   closure via the `npu` argument. A model built on NPU 0 and run by the worker of
   NPU 1 still works but keeps using NPU 0.

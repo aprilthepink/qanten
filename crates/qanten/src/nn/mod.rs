@@ -26,10 +26,12 @@
 //! ```
 
 mod layers;
+mod mlp;
 mod state_dict;
 pub mod transformer;
 
 pub use layers::*;
+pub use mlp::{ActivationKind, MlpLayerInfo, mlp_from_state_dict};
 pub use state_dict::StateDict;
 
 use crate::error::Result;
@@ -86,6 +88,11 @@ impl Sequential {
     /// Appends a layer.
     pub fn push(&mut self, layer: impl Module + 'static) {
         self.layers.push(Box::new(layer));
+    }
+
+    /// Appends an already boxed layer.
+    pub fn push_boxed(&mut self, layer: Box<dyn Module>) {
+        self.layers.push(layer);
     }
 
     /// Number of layers.

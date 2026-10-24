@@ -42,6 +42,7 @@ layers, a simulator, a CLI, and a graphics crate that moves CPU-side 3D work ont
 ## Other crates and tools
 
 - [`qanten-sys`](qanten-sys.md): the raw driver FFI.
+- [Inference server](serve.md): `qanten-serve`, HTTP API, dynamic batching, multi-NPU, metrics.
 - [`qanten` CLI](cli.md): `doctor`, `devices`, `info`, `sensors`, `perf`, `bench`, `selftest`.
 - [Benchmarks](benchmarks.md): criterion suites, simulator baseline, comparing against hardware.
 - [Testing without hardware](testing.md): the simulator, the mock driver, and a checklist for real cards.
