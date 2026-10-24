@@ -12,7 +12,7 @@ All ops batch, and layouts follow PyTorch (`NCHW`, `[out, in]` weights).
 |---|---|---|
 | `mul(npu, a, b)` | any, equal shapes | `a · b` elementwise |
 | `periodic_nl(npu, u, v)` | any, equal shapes | `tcos(u) · v`, the photonic nonlinearity (`tcos` is the optical transfer function, exactly `cos` in the simulator) |
-| `matvec(npu, m, x)` | `m [r, c]`, `x [b, c]` or `[c]` | `out[b, r] = Σ_c m[r, c] · x[b, c]` → `[b, r]` or `[r]` |
+| `matvec(npu, m, x)` | `m [r, c]`, `x [..., c]` | `out[.., r] = Σ_c m[r, c] · x[.., c]` → `[..., r]` |
 | `matmul(npu, a, b)` | `[m, k] @ [k, n]` | `[m, n]` |
 
 ```rust
@@ -34,7 +34,7 @@ fn main() -> qanten::Result<()> {
 
 | Function | Shapes |
 |---|---|
-| `linear(npu, x, weight, bias)` | `x [b, in]` or `[in]`, `weight [out, in]`, `bias [out]` → `[b, out]` |
+| `linear(npu, x, weight, bias)` | `x [..., in]` (any leading dims), `weight [out, in]`, `bias [out]` → `[..., out]` |
 | `LinearWeights::upload(npu, weight)` then `.forward(x)` | same, but the weights stay on the NPU between calls |
 
 Use `LinearWeights` (or `nn::Linear`) whenever the same weights are used more than

@@ -46,6 +46,10 @@ tracing-subscriber.workspace = true
 name = "digit_recognition"
 required-features = ["safetensors"]
 
+[[example]]
+name = "tiny_gpt"
+required-features = ["safetensors"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

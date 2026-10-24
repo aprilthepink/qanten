@@ -7,11 +7,11 @@ use crate::tensor::Tensor;
 
 /// Batched matrix-vector product on the NPU: `out[b, r] = Σ_c matrix[r, c] · vectors[b, c]`.
 ///
-/// `matrix` is `[rows, cols]`, `vectors` is `[batch, cols]` (or `[cols]`),
-/// the result is `[batch, rows]` (or `[rows]`).
+/// `matrix` is `[rows, cols]`, `vectors` is `[..., cols]` with any number of
+/// leading (batch) dimensions; the result is `[..., rows]`.
 pub fn matvec(npu: &Npu, matrix: &Tensor, vectors: &Tensor) -> Result<Tensor> {
     let [rows, cols] = matrix.dims::<2>()?;
-    let (batch, single) = batch_dims("matvec", vectors, cols)?;
+    let (batch, mut shape) = batch_dims("matvec", vectors, cols)?;
     let mut out = vec![bf16::ZERO; batch * rows];
     npu.backend().matvec_batched(
         npu.id(),
@@ -21,26 +21,20 @@ pub fn matvec(npu: &Npu, matrix: &Tensor, vectors: &Tensor) -> Result<Tensor> {
         rows,
         cols,
     )?;
-    if single {
-        Tensor::new(out, [rows])
-    } else {
-        Tensor::new(out, [batch, rows])
-    }
+    shape.push(rows);
+    Tensor::new(out, shape)
 }
 
-/// Splits a `[cols]` or `[batch, cols]` input into `(batch, is_1d)`.
-pub(crate) fn batch_dims(op: &str, x: &Tensor, cols: usize) -> Result<(usize, bool)> {
-    let (batch, single, c) = match x.shape() {
-        [c] => (1, true, *c),
-        [b, c] => (*b, false, *c),
-        s => {
-            return Err(Error::Shape(format!(
-                "{op}: input must be 1-D or 2-D, got {s:?}"
-            )));
-        }
+/// For an input `[..., cols]`: the number of rows (product of the leading
+/// dimensions) and those leading dimensions.
+pub(crate) fn batch_dims(op: &str, x: &Tensor, cols: usize) -> Result<(usize, Vec<usize>)> {
+    let Some((&c, lead)) = x.shape().split_last() else {
+        return Err(Error::Shape(format!(
+            "{op}: input must have at least one dimension"
+        )));
     };
     ensure_shape!(c == cols, "{op}: expected {cols} input features, got {c}");
-    Ok((batch, single))
+    Ok((lead.iter().product(), lead.to_vec()))
 }
 
 /// Matrix product `a @ b` on the NPU, `[m, k] @ [k, n] -> [m, n]`.
@@ -70,7 +64,7 @@ pub(crate) fn transpose2d(data: &[bf16], rows: usize, cols: usize) -> Vec<bf16> 
 
 /// Fully connected layer: `x @ weightᵀ (+ bias)`, PyTorch's `F.linear`.
 ///
-/// `x` is `[batch, in]` or `[in]`, `weight` is `[out, in]`, `bias` is `[out]`.
+/// `x` is `[..., in]` (any leading dimensions), `weight` is `[out, in]`, `bias` is `[out]`.
 pub fn linear(npu: &Npu, x: &Tensor, weight: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
     let y = matvec(npu, weight, x)?;
     match bias {
@@ -108,15 +102,12 @@ impl LinearWeights {
         self.buffer.npu()
     }
 
-    /// `x @ weightᵀ` with `x` of shape `[batch, in]` or `[in]`.
+    /// `x @ weightᵀ` with `x` of shape `[..., in]` (any leading dimensions) → `[..., out]`.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (batch, single) = batch_dims("linear", x, self.in_features())?;
+        let (batch, mut shape) = batch_dims("linear", x, self.in_features())?;
         let y = self.forward_rows(x.data(), batch)?;
-        if single {
-            y.reshape([self.out_features()])
-        } else {
-            Ok(y)
-        }
+        shape.push(self.out_features());
+        y.reshape(shape)
     }
 
     /// Multiplies `batch` row-major input rows; returns `[batch, out]`.

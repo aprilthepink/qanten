@@ -27,6 +27,7 @@
 
 mod layers;
 mod state_dict;
+pub mod transformer;
 
 pub use layers::*;
 pub use state_dict::StateDict;
