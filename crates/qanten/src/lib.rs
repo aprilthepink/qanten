@@ -45,6 +45,7 @@ mod error;
 pub mod executor;
 pub mod fallback;
 pub mod info;
+pub mod linalg;
 mod memory;
 pub mod nn;
 #[cfg(feature = "numpy")]
