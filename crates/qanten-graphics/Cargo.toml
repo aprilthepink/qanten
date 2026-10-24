@@ -1,0 +1,24 @@
+[package]
+name = "qanten-graphics"
+description = "Offload CPU-side graphics and 3D workloads (ocean waves, skinning, blendshapes, light-probe baking, DCT) to Q.ANT photonic NPUs"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["qanten", "qant", "graphics", "gamedev", "photonic"]
+categories = ["graphics", "game-development", "hardware-support"]
+
+[dependencies]
+qanten = { workspace = true, default-features = true }
+glam.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+png.workspace = true
+
+[lints]
+workspace = true

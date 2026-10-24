@@ -37,6 +37,9 @@ jobs:
         run: |
           cargo run --release -p qanten --example quickstart
           cargo run --release -p qanten --example digit_recognition --features safetensors
+          cargo run --release -p qanten-graphics --example ocean -- 128 ocean.png
+          cargo run --release -p qanten-graphics --example crowd -- crowd.png
+          cargo run --release -p qanten-graphics --example probes -- probes.png
       - run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

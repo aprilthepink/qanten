@@ -10,6 +10,7 @@ This workspace gives Rust its own first-class interface, built on the same drive
 |---|---|
 | [`qanten`](crates/qanten) | Safe high-level library: device handles, tensors, ops, NN layers, model loading, simulator |
 | [`qanten-sys`](crates/qanten-sys) | Raw FFI to `libqant_native_computing_driver`, loaded at runtime |
+| [`qanten-graphics`](crates/qanten-graphics) | CPU-side 3D workloads on the NPU: ocean waves, skinning, blendshapes, light-probe baking, DCT |
 | [`qanten-cli`](crates/qanten-cli) | `qanten` command: `doctor`, `devices`, `info`, `sensors`, `perf`, `bench`, `selftest` |
 
 > Unofficial community project, not affiliated with or supported by Q.ANT GmbH.
