@@ -54,6 +54,7 @@ pub mod pool;
 pub mod profile;
 mod rng;
 mod tensor;
+pub mod train;
 
 pub use backend::{BackendKind, DataRole, NpuEntry, SimConfig};
 #[cfg(feature = "driver")]

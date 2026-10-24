@@ -17,6 +17,7 @@ layers, a simulator, a CLI, and a graphics crate that moves CPU-side 3D work ont
 | [Tensors](qanten/tensor.md) | `Tensor`: creating, reshaping, converting, `ndarray` interop |
 | [Operations](qanten/ops.md) | every op in `qanten::ops`, its shapes, and where it runs |
 | [Neural networks](qanten/nn.md) | layers, `Sequential`, `StateDict`, loading PyTorch weights |
+| [Training](qanten/training.md) | backprop on the NPU, KAN training, optimizers, noise-robust training |
 | [Transformers](qanten/transformers.md) | GPT models, attention with KV cache, text generation, loading Q.ANT's TinyGPT |
 | [Device memory](qanten/device-memory.md) | `DeviceBuffer<Weights / Features>`, keeping data on the NPU |
 | [Errors](qanten/errors.md) | the `Error` enum and what each variant means |
