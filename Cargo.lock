@@ -620,6 +620,7 @@ dependencies = [
  "half",
  "miniz_oxide 0.8.9",
  "ndarray",
+ "png",
  "qanten-sys",
  "rayon",
  "safetensors",
