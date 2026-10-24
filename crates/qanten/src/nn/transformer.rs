@@ -81,7 +81,7 @@ impl GptConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.n_head == 0 || self.n_embd % self.n_head != 0 {
+        if self.n_head == 0 || !self.n_embd.is_multiple_of(self.n_head) {
             return Err(Error::InvalidArgument(format!(
                 "n_embd ({}) must be a positive multiple of n_head ({})",
                 self.n_embd, self.n_head
@@ -191,7 +191,7 @@ impl CausalSelfAttention {
             proj.out_features(),
             proj.in_features()
         );
-        if heads == 0 || d % heads != 0 {
+        if heads == 0 || !d.is_multiple_of(heads) {
             return Err(Error::InvalidArgument(format!(
                 "{d} is not divisible by {heads} heads"
             )));
