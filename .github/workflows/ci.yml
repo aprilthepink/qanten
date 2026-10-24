@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo test --workspace --all-features
+      - run: cargo test -p qant --no-default-features
+      - name: FFI path against the mock driver
+        run: |
+          cargo build -p qant-mock-driver
+          export QANT_DRIVER_LIB=$PWD/target/debug/libqant_native_computing_driver.so
+          cargo test -p qant --test driver_ffi
+          cargo run -p qant-cli -- doctor
+          cargo run -p qant-cli -- selftest
+      - name: Examples
+        run: |
+          cargo run --release -p qant --example quickstart
+          cargo run --release -p qant --example digit_recognition --features safetensors
+      - run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - run: cargo check --workspace --all-features

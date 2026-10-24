@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["crates/qant-sys", "crates/qant", "crates/qant-cli", "crates/qant-mock-driver"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/OWNER/qant-rs"
+authors = ["qant-rs contributors"]
+keywords = ["qant", "photonic", "npu", "accelerator", "neural-network"]
+categories = ["hardware-support", "science", "api-bindings"]
+
+[workspace.dependencies]
+qant-sys = { path = "crates/qant-sys", version = "0.1.0" }
+qant = { path = "crates/qant", version = "0.1.0", default-features = false }
+half = "2.7"
+libloading = "0.9"
+thiserror = "2"
+rayon = "1.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ndarray = "0.17"
+safetensors = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+mem_forget = "deny"
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+lto = "thin"

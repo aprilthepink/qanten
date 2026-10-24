@@ -1,0 +1,50 @@
+[package]
+name = "qant"
+description = "Batteries-included Rust SDK for Q.ANT photonic native processing units (NPUs): safe device handles, tensors, NN layers, model loading and a built-in simulator"
+readme = "../../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["examples/data/*"]
+
+[features]
+default = ["driver"]
+## Load the real Q.ANT driver at runtime (needs no driver at build time).
+driver = ["dep:qant-sys"]
+## Conversions between `Tensor` and `ndarray::ArrayD`.
+ndarray = ["dep:ndarray"]
+## Load PyTorch / NumPy weights from `.safetensors` files.
+safetensors = ["dep:safetensors"]
+## `serde::Serialize` for device info, sensor readings and perf counters.
+serde = ["dep:serde"]
+full = ["driver", "ndarray", "safetensors", "serde"]
+
+[dependencies]
+qant-sys = { workspace = true, optional = true }
+half = { workspace = true, features = ["num-traits"] }
+thiserror.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+ndarray = { workspace = true, optional = true }
+safetensors = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+anyhow.workspace = true
+tracing-subscriber.workspace = true
+
+[[example]]
+name = "digit_recognition"
+required-features = ["safetensors"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lints]
+workspace = true
