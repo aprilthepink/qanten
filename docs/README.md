@@ -20,6 +20,7 @@ layers, a simulator, a CLI, and a graphics crate that moves CPU-side 3D work ont
 | [Device memory](qanten/device-memory.md) | `DeviceBuffer<Weights / Features>`, keeping data on the NPU |
 | [Errors](qanten/errors.md) | the `Error` enum and what each variant means |
 | [Multiple NPUs and CPU fallback](qanten/scaling.md) | `NpuPool`, replicated models, routing small jobs to the CPU |
+| [Async and background execution](qanten/async.md) | `NpuExecutor`, `JobHandle` futures, any async runtime |
 | [Profiling](qanten/profiling.md) | per-op time, data moved, MACs and device memory |
 
 ## `qanten-graphics` (3D workloads)

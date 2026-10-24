@@ -39,6 +39,7 @@ miniz_oxide = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
+tokio.workspace = true
 tracing-subscriber.workspace = true
 
 [[example]]

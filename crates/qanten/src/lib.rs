@@ -42,6 +42,7 @@
 pub mod backend;
 mod device;
 mod error;
+pub mod executor;
 pub mod fallback;
 pub mod info;
 mod memory;
