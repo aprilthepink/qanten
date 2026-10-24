@@ -12,7 +12,7 @@
 //!   batch/layer norm, activations, the photonic periodic nonlinearity and
 //!   KAN layers.
 //! - **[`nn`]**: PyTorch-style layers with weights resident on the NPU,
-//!   [`nn::Sequential`], and [`nn::StateDict`] to load `.safetensors` weights.
+//!   [`nn::Sequential`], and [`nn::StateDict`] to load `.safetensors` or NumPy `.npz` weights.
 //! - **[`DeviceBuffer`]**: typed device memory; the type system stops you
 //!   from downloading weights or mixing up operand roles.
 //! - **Simulator** with optional noise, memory limits and multiple NPUs, for
@@ -45,6 +45,8 @@ mod error;
 pub mod info;
 mod memory;
 pub mod nn;
+#[cfg(feature = "numpy")]
+pub mod numpy;
 pub mod ops;
 mod rng;
 mod tensor;

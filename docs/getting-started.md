@@ -55,6 +55,7 @@ Details: [NPUs and backends](qanten/npu.md).
 |---|---|---|
 | `driver` | yes | Hardware backend (loaded at run time) |
 | `safetensors` | | `StateDict::load_safetensors` / `save_safetensors` |
+| `numpy` | | `.npy` / `.npz` load and save |
 | `ndarray` | | `Tensor` ⇄ `ndarray::ArrayD` |
 | `serde` | | `Serialize` for device info, sensors, perf counters |
 | `full` | | all of the above |

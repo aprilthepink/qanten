@@ -78,6 +78,23 @@ Any float or integer dtype (`f32`, `f16`, `bf16`, `f64`, `i64`, …) converts to
 `sd.sub("encoder")` returns the tensors under `encoder.` with the prefix stripped,
 which helps when building sub-models. `save_safetensors` writes `bf16` files.
 
+## Loading NumPy weights (feature `numpy`)
+
+Q.ANT's own examples ship weights as `.npz`. `StateDict::load_npz` reads anything
+`np.savez` / `np.savez_compressed` writes (float, int and bool arrays, either byte
+order, C or Fortran layout); array names become tensor names:
+
+<!-- doccheck: ignore -->
+```rust
+let sd = qanten::nn::StateDict::load_npz("network_weights.npz")?;
+let w1 = sd.get("l1_w")?;                         // [133, 784]
+sd.save_npz("copy.npz")?;                         // np.load() reads it back
+let t = qanten::numpy::load_npy("array.npy")?;    // single arrays
+qanten::numpy::save_npy("out.npy", &t)?;
+```
+
+Writing produces little-endian `float32` arrays in an uncompressed archive.
+
 ## Worked example: Q.ANT's digit recogniser
 
 `crates/qanten/examples/digit_recognition.rs` runs Q.ANT's pretrained MNIST network

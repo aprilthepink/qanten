@@ -15,7 +15,8 @@ Copyright Q.ANT GmbH, licensed under the Apache License, Version 2.0:
     padding, non-divisible adaptive pooling, bug fixes).
 
 The pretrained digit-recognition weights in
-crates/qanten/examples/data/digit_recognition.safetensors are converted from
+crates/qanten/examples/data/digit_recognition.safetensors (converted) and
+crates/qanten/examples/data/qant_digit_weights.npz (unchanged copy) come from
 https://github.com/Q-ANT-GmbH/qant_native_computing_toolkit_examples
 (python/digit_recognition/network_weights.npz), Copyright Q.ANT GmbH,
 Apache License, Version 2.0.
