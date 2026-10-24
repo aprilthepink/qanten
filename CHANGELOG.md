@@ -15,3 +15,5 @@ official toolkit v2.4.0.
 - `qanten-graphics`: CPU-side 3D workloads as NPU matrix products: Gerstner
   ocean (one matmul per frame), linear blend skinning and blendshapes for
   crowds, SH9 light-probe baking, 8×8 DCT. CPU fallbacks and rendered examples.
+- `examples/machine-monitor`: example application, vibration-based predictive
+  maintenance (NPU signal processing, training, multi-NPU monitoring, HTTP serving).

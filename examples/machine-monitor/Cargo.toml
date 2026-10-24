@@ -1,0 +1,21 @@
+[package]
+name = "machine-monitor"
+description = "Example project: vibration-based predictive maintenance on Q.ANT NPUs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+qanten = { workspace = true, features = ["driver", "safetensors"] }
+qanten-serve = { path = "../../crates/qanten-serve" }
+axum.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

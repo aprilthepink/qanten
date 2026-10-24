@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/qanten-sys", "crates/qanten", "crates/qanten-cli", "crates/qanten-graphics", "crates/qanten-serve", "crates/qanten-mock-driver"]
+members = ["crates/qanten-sys", "crates/qanten", "crates/qanten-cli", "crates/qanten-graphics", "crates/qanten-serve", "crates/qanten-mock-driver", "examples/machine-monitor"]
 
 [workspace.package]
 version = "0.1.0"

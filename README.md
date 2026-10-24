@@ -87,6 +87,10 @@ cargo run --example device_memory
 cargo run --example digit_recognition --features safetensors
 ```
 
+For a complete application, see [`examples/machine-monitor`](examples/machine-monitor):
+vibration-based predictive maintenance that trains a fault classifier on the NPU,
+monitors a simulated plant across several NPUs and serves diagnoses over HTTP.
+
 `digit_recognition` runs Q.ANT's own pretrained MNIST network
 (784 → 133 → 10). Results on the full 10,000-image test set:
 

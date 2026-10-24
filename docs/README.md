@@ -42,6 +42,7 @@ layers, a simulator, a CLI, and a graphics crate that moves CPU-side 3D work ont
 ## Other crates and tools
 
 - [`qanten-sys`](qanten-sys.md): the raw driver FFI.
+- [Example project: machine-monitor](../examples/machine-monitor/README.md): predictive maintenance from vibration data, training, multi-NPU monitoring and serving.
 - [Inference server](serve.md): `qanten-serve`, HTTP API, dynamic batching, multi-NPU, metrics.
 - [`qanten` CLI](cli.md): `doctor`, `devices`, `info`, `sensors`, `perf`, `bench`, `selftest`.
 - [Benchmarks](benchmarks.md): criterion suites, simulator baseline, comparing against hardware.
