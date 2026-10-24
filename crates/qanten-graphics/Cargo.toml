@@ -18,7 +18,12 @@ rayon.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+criterion.workspace = true
 png.workspace = true
+
+[[bench]]
+name = "graphics"
+harness = false
 
 [lints]
 workspace = true

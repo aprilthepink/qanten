@@ -41,6 +41,7 @@ miniz_oxide = { workspace = true, optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
+criterion.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 
@@ -51,6 +52,11 @@ required-features = ["safetensors"]
 [[example]]
 name = "tiny_gpt"
 required-features = ["safetensors"]
+
+[[bench]]
+name = "core"
+harness = false
+required-features = ["onnx"]
 
 [package.metadata.docs.rs]
 all-features = true

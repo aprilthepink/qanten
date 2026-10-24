@@ -41,4 +41,5 @@ layers, a simulator, a CLI, and a graphics crate that moves CPU-side 3D work ont
 
 - [`qanten-sys`](qanten-sys.md): the raw driver FFI.
 - [`qanten` CLI](cli.md): `doctor`, `devices`, `info`, `sensors`, `perf`, `bench`, `selftest`.
+- [Benchmarks](benchmarks.md): criterion suites, simulator baseline, comparing against hardware.
 - [Testing without hardware](testing.md): the simulator, the mock driver, and a checklist for real cards.

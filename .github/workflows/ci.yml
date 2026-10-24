@@ -26,6 +26,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features
       - run: cargo test --workspace --all-features
       - run: cargo test -p qanten --no-default-features
+      - run: cargo bench --workspace --all-features --no-run
       - name: FFI path against the mock driver
         run: |
           cargo build -p qanten-mock-driver

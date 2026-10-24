@@ -29,6 +29,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 anyhow = "1"
 glam = "0.34"
 miniz_oxide = "0.8"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 png = "0.18"
 
