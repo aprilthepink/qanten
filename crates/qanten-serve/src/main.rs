@@ -30,6 +30,12 @@ struct Args {
     /// Milliseconds the batcher waits for more requests.
     #[arg(long, default_value_t = 2)]
     max_wait_ms: u64,
+    /// Largest accepted request body, in MiB.
+    #[arg(long, default_value_t = 16)]
+    max_body_mb: usize,
+    /// Seconds before an inference request fails with 504.
+    #[arg(long, default_value_t = 30)]
+    timeout_s: u64,
     /// Activation between layers of MLP weight files: relu, tanh, sigmoid, gelu or silu.
     #[arg(long, default_value = "relu")]
     activation: ActivationKind,
@@ -63,6 +69,8 @@ async fn main() -> Result<()> {
     let config = ServerConfig {
         max_batch_rows: args.max_batch.max(1),
         max_wait: Duration::from_millis(args.max_wait_ms),
+        max_body_bytes: args.max_body_mb.saturating_mul(1 << 20),
+        request_timeout: Duration::from_secs(args.timeout_s.max(1)),
     };
     let mut state = AppState::new(&pool, config)?;
     let activation = args.activation;

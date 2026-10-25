@@ -16,10 +16,16 @@ qanten-serve --sim --sim-npus 2 -m classifier=model.onnx
 | `--addr` | `127.0.0.1:8080` | also `QANTEN_SERVE_ADDR` |
 | `--max-batch` | 64 | maximum rows per NPU batch |
 | `--max-wait-ms` | 2 | how long to wait for more requests to batch |
+| `--max-body-mb` | 16 | larger request bodies get 413 |
+| `--timeout-s` | 30 | inference slower than this gets 504 |
 | `--activation` | `relu` | between layers of MLP weight files |
 | `--sim`, `--sim-npus N` | off, 1 | simulated NPUs instead of hardware |
 
 Without `--sim` it opens every NPU the driver reports.
+
+Model names may contain only 1–64 of `A-Z a-z 0-9 . _ -`. Requests whose
+tensors would exceed `qanten::limits::MAX_ELEMENTS` (2²⁸ values) or rank 32
+are rejected with 400 before anything is allocated.
 
 ## API
 

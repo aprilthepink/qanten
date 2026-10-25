@@ -16,20 +16,39 @@ pub struct Tensor {
     shape: Vec<usize>,
 }
 
+/// Element count of `shape`; panics (like `Vec` capacity overflow) if the
+/// product does not fit in `usize`. Fallible paths use [`Tensor::checked_numel`].
 fn numel(shape: &[usize]) -> usize {
-    shape.iter().product()
+    Tensor::checked_numel(shape)
+        .unwrap_or_else(|| panic!("tensor shape {shape:?} has more elements than fit in usize"))
 }
 
 impl Tensor {
+    /// Number of elements of `shape`, or `None` if it overflows `usize`.
+    ///
+    /// Zero-sized dimensions don't hide overflow: the product of the
+    /// non-zero dimensions must fit too, so every partial product of a valid
+    /// shape (which ops compute for strides) fits. For shapes from untrusted
+    /// sources, prefer [`limits::elements`](crate::limits::elements), which
+    /// also caps the size.
+    pub fn checked_numel(shape: &[usize]) -> Option<usize> {
+        let nonzero = shape
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d.max(1)))?;
+        Some(if shape.contains(&0) { 0 } else { nonzero })
+    }
+
     /// Creates a tensor from `bf16` data. Fails if `data.len()` does not match `shape`.
     pub fn new(data: Vec<bf16>, shape: impl Into<Vec<usize>>) -> Result<Self> {
         let shape = shape.into();
+        let want = Self::checked_numel(&shape)
+            .ok_or_else(|| Error::Shape(format!("shape {shape:?} overflows usize")))?;
         ensure_shape!(
-            data.len() == numel(&shape),
+            data.len() == want,
             "data has {} elements but shape {:?} needs {}",
             data.len(),
             shape,
-            numel(&shape)
+            want
         );
         Ok(Self { data, shape })
     }
@@ -169,7 +188,7 @@ impl Tensor {
             _ => bail_shape!("at most one dimension can be inferred, got {:?}", shape),
         }
         ensure_shape!(
-            numel(&shape) == self.len(),
+            Self::checked_numel(&shape) == Some(self.len()),
             "cannot reshape {:?} ({} elements) into {:?}",
             self.shape,
             self.len(),

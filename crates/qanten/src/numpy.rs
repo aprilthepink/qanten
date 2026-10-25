@@ -166,7 +166,7 @@ pub fn read_npy(bytes: &[u8]) -> Result<Tensor> {
         .get(start..start + header_len)
         .ok_or_else(|| fmt_err("npy header truncated"))?;
     let header = parse_header(&String::from_utf8_lossy(header_bytes))?;
-    let count: usize = header.shape.iter().product();
+    let count = crate::limits::elements(&header.shape)?;
     let mut data = decode(&header.descr, &bytes[start + header_len..], count)?;
     if header.fortran {
         data = fortran_to_c(data, &header.shape);
@@ -271,10 +271,23 @@ fn unzip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
         let raw = bytes
             .get(data_start..data_start + comp_size)
             .ok_or_else(|| fmt_err(format!("{name}: data truncated")))?;
+        // An entry never needs more than the largest tensor we accept (8-byte
+        // elements) plus a generous allowance for the .npy header.
+        let max_entry = crate::limits::MAX_ELEMENTS * 8 + (1 << 20);
+        if size > max_entry {
+            return Err(fmt_err(format!(
+                "{name}: entry of {size} bytes is too large"
+            )));
+        }
         let data = match method {
             0 => raw.to_vec(),
-            8 => miniz_oxide::inflate::decompress_to_vec(raw)
-                .map_err(|e| fmt_err(format!("{name}: deflate error {e:?}")))?,
+            // Inflate at most the declared size, so a zip bomb can't expand
+            // past it before the size check below.
+            8 => miniz_oxide::inflate::decompress_to_vec_with_limit(raw, size).map_err(|e| {
+                fmt_err(format!(
+                    "{name}: deflate error or entry larger than declared ({e:?})"
+                ))
+            })?,
             m => return Err(fmt_err(format!("{name}: unsupported zip compression {m}"))),
         };
         if data.len() != size {

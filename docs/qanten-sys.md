@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lib = unsafe { DriverLibrary::load()? };
     println!("loaded {:?}", lib.path());
     // SAFETY: plain value call.
-    let status: QantDriverError = unsafe { (lib.init_npu)(0) };
+    let status: QantDriverError = unsafe { lib.init_npu(0) };
     if !status.is_ok() {
         eprintln!("init failed: {} ({})", status.message(), status.code);
     }

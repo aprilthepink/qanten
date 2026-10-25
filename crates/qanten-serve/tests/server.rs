@@ -29,6 +29,8 @@ fn app_with(npus: u32, wait_ms: u64, max_batch_rows: usize) -> Router {
         ServerConfig {
             max_batch_rows,
             max_wait: Duration::from_millis(wait_ms),
+            max_body_bytes: 1 << 20,
+            ..ServerConfig::default()
         },
     )
     .unwrap();
@@ -239,5 +241,79 @@ async fn errors() {
         m.as_str()
             .unwrap()
             .contains("qanten_request_errors_total{model=\"mlp\"} 2")
+    );
+}
+
+#[tokio::test]
+async fn hostile_requests_are_rejected_cleanly() {
+    let app = app(1, 1);
+    let infer = "/v1/models/mlp/infer";
+    // A shape that asks for 2^40 values, and one whose overflow hides behind a 0.
+    for shape in [
+        serde_json::json!([1 << 20, 1 << 20]),
+        serde_json::json!([0, 1u64 << 62, 1u64 << 62]),
+    ] {
+        let (status, body) = call(
+            &app,
+            "POST",
+            infer,
+            Some(serde_json::json!({"shape": shape, "data": []})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    // Too many dimensions.
+    let (status, _) = call(
+        &app,
+        "POST",
+        infer,
+        Some(serde_json::json!({"shape": vec![1; 64], "data": [0.0]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // A body over the limit (1 MiB here) is refused before parsing.
+    let big = serde_json::json!({"shape": [1, 300_000], "data": vec![0.5; 300_000]});
+    let (status, _) = call(&app, "POST", infer, Some(big)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    // Unknown model names are echoed truncated.
+    let long = "x".repeat(500);
+    let (status, body) = call(
+        &app,
+        "POST",
+        &format!("/v1/models/{long}/infer"),
+        Some(serde_json::json!({"shape": [1], "data": [1.0]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().len() < 100);
+    // The server still works afterwards.
+    let (status, _) = call(&app, "GET", "/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn model_names_are_restricted() {
+    let pool = NpuPool::simulated(1).unwrap();
+    let mut state = AppState::new(&pool, ServerConfig::default()).unwrap();
+    for bad in ["", "a\"b", "x\ny", "has space", &"n".repeat(65)] {
+        assert!(
+            state
+                .add_model_file(
+                    bad,
+                    format!("{ONNX}/mlp.onnx").as_ref(),
+                    ActivationKind::Relu
+                )
+                .is_err(),
+            "{bad:?} should be rejected"
+        );
+    }
+    assert!(
+        state
+            .add_model_file(
+                "mlp-v1.2_b",
+                format!("{ONNX}/mlp.onnx").as_ref(),
+                ActivationKind::Relu
+            )
+            .is_ok()
     );
 }

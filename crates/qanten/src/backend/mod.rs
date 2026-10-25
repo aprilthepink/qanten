@@ -138,6 +138,13 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     fn reset_perf_counters(&self, npu: u32) -> Result<()>;
 }
 
+/// `a · b` for buffer sizes; an overflow is a shape error, never a wrapped
+/// length that could slip past [`check_len`] and reach the driver.
+pub(crate) fn checked_size(npu: u32, what: &str, a: usize, b: usize) -> Result<usize> {
+    a.checked_mul(b)
+        .ok_or_else(|| crate::Error::Shape(format!("NPU {npu}: {what}: {a} × {b} overflows usize")))
+}
+
 pub(crate) fn check_len(npu: u32, what: &str, got: usize, want: usize) -> Result<()> {
     if got != want {
         return Err(crate::Error::Shape(format!(

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CString, c_char};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use half::bf16;
@@ -11,7 +11,7 @@ use qanten_sys::{
     QantDriverHandle, c_buf_to_string,
 };
 
-use super::{Backend, BackendKind, DataRole, NpuEntry, RawHandle, check_len};
+use super::{Backend, BackendKind, DataRole, NpuEntry, RawHandle, check_len, checked_size};
 use crate::error::{Error, Result};
 use crate::info::{DeviceInfo, PerfCounters, SensorReadings, VersionInfo};
 
@@ -26,18 +26,37 @@ struct Alloc {
 ///
 /// The driver reads and writes raw pointers with lengths it derives from the
 /// allocation size. To keep that sound behind a safe API, this backend
-/// remembers every allocation it made and checks slice lengths and handle
-/// validity before calling into the driver.
+/// remembers every allocation it made and checks slice lengths, roles,
+/// shapes and handle validity before calling into the driver. The
+/// allocation table stays locked for the whole driver call (shared for
+/// uploads, downloads and products, exclusive for `free`), so a handle can
+/// never be freed while another thread is using it.
 #[derive(Debug)]
 pub struct DriverBackend {
     lib: DriverLibrary,
-    allocs: Mutex<HashMap<RawHandle, Alloc>>,
+    allocs: RwLock<HashMap<RawHandle, Alloc>>,
 }
 
 static GLOBAL: Mutex<Option<Arc<DriverBackend>>> = Mutex::new(None);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn read<T>(m: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write<T>(m: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn invalid_handle(npu: u32) -> Error {
+    Error::Driver {
+        npu,
+        code: -1,
+        message: "invalid memory handle".into(),
+    }
 }
 
 fn check(npu: u32, err: QantDriverError) -> Result<()> {
@@ -77,7 +96,7 @@ impl DriverBackend {
         tracing::debug!(path = ?lib.path(), "loaded Q.ANT driver");
         Ok(Self {
             lib,
-            allocs: Mutex::new(HashMap::new()),
+            allocs: RwLock::new(HashMap::new()),
         })
     }
 
@@ -88,7 +107,7 @@ impl DriverBackend {
             .map_err(|e| Error::DriverUnavailable(e.to_string()))?;
         Ok(Self {
             lib,
-            allocs: Mutex::new(HashMap::new()),
+            allocs: RwLock::new(HashMap::new()),
         })
     }
 
@@ -108,15 +127,10 @@ impl DriverBackend {
         &self.lib
     }
 
-    fn alloc_of(&self, h: RawHandle) -> Result<Alloc> {
-        lock(&self.allocs)
-            .get(&h)
-            .copied()
-            .ok_or_else(|| Error::Driver {
-                npu: h.npu,
-                code: -1,
-                message: "invalid memory handle".into(),
-            })
+    /// The allocation table, read-locked: hold the guard across the driver
+    /// call that uses the handles it validated.
+    fn allocations(&self) -> RwLockReadGuard<'_, HashMap<RawHandle, Alloc>> {
+        read(&self.allocs)
     }
 
     /// Configures the driver's own log files.
@@ -131,9 +145,7 @@ impl DriverBackend {
             tracing::Level::ERROR => 4,
         };
         // SAFETY: valid NUL-terminated string that outlives the call.
-        check(0, unsafe {
-            (self.lib.setup_logging)(folder.as_ptr(), level)
-        })
+        check(0, unsafe { self.lib.setup_logging(folder.as_ptr(), level) })
     }
 }
 
@@ -148,12 +160,12 @@ impl Backend for DriverBackend {
 
     fn init_npu(&self, npu: u32) -> Result<()> {
         // SAFETY: plain value call.
-        check(npu, unsafe { (self.lib.init_npu)(npu) })
+        check(npu, unsafe { self.lib.init_npu(npu) })
     }
 
     fn release_npu(&self, npu: u32) -> Result<()> {
         // SAFETY: plain value call.
-        check(npu, unsafe { (self.lib.release_npu)(npu) })
+        check(npu, unsafe { self.lib.release_npu(npu) })
     }
 
     fn available_npus(&self) -> Result<Vec<NpuEntry>> {
@@ -163,7 +175,8 @@ impl Backend for DriverBackend {
         let mut count = 0usize;
         // SAFETY: both buffers hold CAP entries, as announced by `capacity`.
         let err = unsafe {
-            (self.lib.get_available_npus)(ids.as_mut_ptr(), serials.as_mut_ptr(), CAP, &mut count)
+            self.lib
+                .get_available_npus(ids.as_mut_ptr(), serials.as_mut_ptr(), CAP, &mut count)
         };
         check(0, err)?;
         Ok((0..count.min(CAP))
@@ -182,7 +195,8 @@ impl Backend for DriverBackend {
         }
         // SAFETY: all three buffers hold `a.len()` elements.
         check(npu, unsafe {
-            (self.lib.mul_npu)(npu, a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), a.len())
+            self.lib
+                .mul_npu(npu, a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), a.len())
         })
     }
 
@@ -194,13 +208,8 @@ impl Backend for DriverBackend {
         }
         // SAFETY: all three buffers hold `u.len()` elements.
         check(npu, unsafe {
-            (self.lib.scaled_periodic_nl_npu)(
-                npu,
-                u.as_ptr(),
-                v.as_ptr(),
-                out.as_mut_ptr(),
-                u.len(),
-            )
+            self.lib
+                .scaled_periodic_nl_npu(npu, u.as_ptr(), v.as_ptr(), out.as_mut_ptr(), u.len())
         })
     }
 
@@ -213,7 +222,12 @@ impl Backend for DriverBackend {
         rows: usize,
         cols: usize,
     ) -> Result<()> {
-        check_len(npu, "matrix", matrix.len(), rows * cols)?;
+        check_len(
+            npu,
+            "matrix",
+            matrix.len(),
+            checked_size(npu, "matrix", rows, cols)?,
+        )?;
         if cols == 0 || !vectors.len().is_multiple_of(cols) {
             return Err(Error::Shape(format!(
                 "vector batch of {} values is not a multiple of {cols} columns",
@@ -221,13 +235,18 @@ impl Backend for DriverBackend {
             )));
         }
         let n_vecs = vectors.len() / cols;
-        check_len(npu, "matvec output", out.len(), n_vecs * rows)?;
+        check_len(
+            npu,
+            "matvec output",
+            out.len(),
+            checked_size(npu, "matvec output", n_vecs, rows)?,
+        )?;
         if out.is_empty() {
             return Ok(());
         }
         // SAFETY: lengths checked above match (rows, cols, n_vecs).
         check(npu, unsafe {
-            (self.lib.mul_matrix_vec_batched)(
+            self.lib.mul_matrix_vec_batched(
                 npu,
                 matrix.as_ptr(),
                 vectors.as_ptr(),
@@ -249,50 +268,61 @@ impl Backend for DriverBackend {
         };
         // SAFETY: `out` is a valid destination for one handle.
         check(npu, unsafe {
-            (self.lib.allocate)(npu, rows, cols, to_sys_role(role), &mut out)
+            self.lib
+                .allocate(npu, rows, cols, to_sys_role(role), &mut out)
         })?;
         let h = RawHandle {
             npu: out.npu_id,
             key: out.key,
         };
-        lock(&self.allocs).insert(h, Alloc { rows, cols, role });
+        write(&self.allocs).insert(h, Alloc { rows, cols, role });
         Ok(h)
     }
 
     fn free(&self, handle: RawHandle) -> Result<()> {
-        if lock(&self.allocs).remove(&handle).is_none() {
+        // Exclusive: no upload/download/product can be using the handle.
+        let mut allocs = write(&self.allocs);
+        if allocs.remove(&handle).is_none() {
             return Err(Error::Driver {
                 npu: handle.npu,
                 code: -1,
                 message: "invalid memory handle (double free?)".into(),
             });
         }
-        // SAFETY: the handle came from `allocate` and was not freed before.
-        check(handle.npu, unsafe {
-            (self.lib.free)(to_sys_handle(handle))
-        })
+        // SAFETY: the handle came from `allocate`, was not freed before, and
+        // no other call holds it (we own the write lock).
+        check(handle.npu, unsafe { self.lib.free(to_sys_handle(handle)) })
     }
 
     fn upload(&self, handle: RawHandle, data: &[bf16]) -> Result<()> {
-        let a = self.alloc_of(handle)?;
+        let allocs = self.allocations();
+        let a = allocs
+            .get(&handle)
+            .ok_or_else(|| invalid_handle(handle.npu))?;
         check_len(handle.npu, "upload", data.len(), a.rows * a.cols)?;
-        // SAFETY: the driver reads rows*cols values, which `data` holds.
+        // SAFETY: the driver reads rows*cols values, which `data` holds
+        // (rows*cols was overflow-checked in `allocate`); the read lock keeps
+        // the handle alive for the call.
         check(handle.npu, unsafe {
-            (self.lib.upload)(to_sys_handle(handle), data.as_ptr())
+            self.lib.upload(to_sys_handle(handle), data.as_ptr())
         })
     }
 
     fn download(&self, handle: RawHandle, out: &mut [bf16]) -> Result<()> {
-        let a = self.alloc_of(handle)?;
+        let allocs = self.allocations();
+        let a = allocs
+            .get(&handle)
+            .ok_or_else(|| invalid_handle(handle.npu))?;
         if a.role != DataRole::Features {
             return Err(Error::Unsupported(
                 "weights memory cannot be downloaded".into(),
             ));
         }
         check_len(handle.npu, "download", out.len(), a.rows * a.cols)?;
-        // SAFETY: the driver writes rows*cols values, which fit into `out`.
+        // SAFETY: the driver writes rows*cols values, which fit into `out`;
+        // the read lock keeps the handle alive for the call.
         check(handle.npu, unsafe {
-            (self.lib.download)(to_sys_handle(handle), out.as_mut_ptr())
+            self.lib.download(to_sys_handle(handle), out.as_mut_ptr())
         })
     }
 
@@ -302,13 +332,34 @@ impl Backend for DriverBackend {
         vectors: RawHandle,
         result: RawHandle,
     ) -> Result<()> {
-        // Validate handles so the driver never sees a stale one.
-        self.alloc_of(matrix)?;
-        self.alloc_of(vectors)?;
-        self.alloc_of(result)?;
-        // SAFETY: all handles are live allocations of this driver.
+        // Validate handles, roles and shapes (as the simulator does) so the
+        // driver never sees a stale handle or writes past the result block.
+        let allocs = self.allocations();
+        let get = |h: RawHandle| allocs.get(&h).ok_or_else(|| invalid_handle(h.npu));
+        let (m, v, r) = (get(matrix)?, get(vectors)?, get(result)?);
+        if matrix.npu != vectors.npu || matrix.npu != result.npu {
+            return Err(Error::InvalidArgument(
+                "operands live on different NPUs".into(),
+            ));
+        }
+        if m.role != DataRole::Weights
+            || v.role != DataRole::Features
+            || r.role != DataRole::Features
+        {
+            return Err(Error::InvalidArgument(
+                "expected roles (Weights, Features, Features)".into(),
+            ));
+        }
+        if m.cols != v.cols || r.rows != v.rows || r.cols != m.rows {
+            return Err(Error::Shape(format!(
+                "matrix {}x{}, vectors {}x{}, result {}x{} do not fit",
+                m.rows, m.cols, v.rows, v.cols, r.rows, r.cols
+            )));
+        }
+        // SAFETY: all handles are live allocations of this driver with
+        // compatible roles and shapes; the read lock keeps them alive.
         check(matrix.npu, unsafe {
-            (self.lib.mul_matrix_vec_batched_mem)(
+            self.lib.mul_matrix_vec_batched_mem(
                 to_sys_handle(matrix),
                 to_sys_handle(vectors),
                 to_sys_handle(result),
@@ -320,14 +371,14 @@ impl Backend for DriverBackend {
         let mut buf = vec![0 as c_char; C_STRING_DEFAULT_LENGTH];
         // SAFETY: `buf` holds `len` bytes.
         check(npu, unsafe {
-            (self.lib.get_version)(npu, buf.as_mut_ptr(), buf.len())
+            self.lib.get_version(npu, buf.as_mut_ptr(), buf.len())
         })?;
         Ok(c_buf_to_string(&buf))
     }
 
     fn device_info(&self, npu: u32) -> Result<DeviceInfo> {
         // SAFETY: plain value call returning a struct by value.
-        let info = unsafe { (self.lib.get_device_info)(npu) };
+        let info = unsafe { self.lib.get_device_info(npu) };
         check(npu, info.error.clone())?;
         let s = info.sensor_info;
         Ok(DeviceInfo {
@@ -361,7 +412,7 @@ impl Backend for DriverBackend {
     fn perf_counters(&self, npu: u32) -> Result<PerfCounters> {
         let mut out = PerformanceCounterInfo::default();
         // SAFETY: `out` is a valid destination.
-        check(npu, unsafe { (self.lib.get_perf_counter)(npu, &mut out) })?;
+        check(npu, unsafe { self.lib.get_perf_counter(npu, &mut out) })?;
         Ok(PerfCounters {
             elapsed: Duration::from_secs_f64(out.timebased_counter.max(0.0)),
             stalled: Duration::from_secs_f64(out.stalling_counter.max(0.0)),
@@ -370,6 +421,6 @@ impl Backend for DriverBackend {
 
     fn reset_perf_counters(&self, npu: u32) -> Result<()> {
         // SAFETY: plain value call.
-        check(npu, unsafe { (self.lib.reset_perf_counter)(npu) })
+        check(npu, unsafe { self.lib.reset_perf_counter(npu) })
     }
 }

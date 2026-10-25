@@ -34,13 +34,17 @@ use qanten::{Npu, Tensor};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
-/// Server tuning.
+/// Server tuning and limits.
 #[derive(Debug, Clone, Copy)]
 pub struct ServerConfig {
     /// Maximum rows merged into one NPU batch.
     pub max_batch_rows: usize,
     /// How long the batcher waits for more requests after the first one.
     pub max_wait: Duration,
+    /// Largest accepted request body.
+    pub max_body_bytes: usize,
+    /// An inference request that takes longer fails with 504.
+    pub request_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -48,8 +52,32 @@ impl Default for ServerConfig {
         Self {
             max_batch_rows: 64,
             max_wait: Duration::from_millis(2),
+            max_body_bytes: 16 << 20,
+            request_timeout: Duration::from_secs(30),
         }
     }
+}
+
+/// Model names: 1–64 characters of `[A-Za-z0-9._-]`. They appear in URLs,
+/// error messages and Prometheus labels, so nothing else is allowed.
+fn check_model_name(name: &str) -> anyhow::Result<()> {
+    let ok = (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    anyhow::ensure!(
+        ok,
+        "invalid model name {name:?}: use 1-64 characters from A-Z, a-z, 0-9, '.', '_', '-'"
+    );
+    Ok(())
+}
+
+/// Escapes a Prometheus label value (`\`, `"`, newline).
+fn label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Input description returned by `/v1/models`.
@@ -178,6 +206,7 @@ impl AppState {
         path: &std::path::Path,
         activation: ActivationKind,
     ) -> anyhow::Result<()> {
+        check_model_name(name)?;
         let ext = path
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
@@ -247,6 +276,7 @@ impl AppState {
         M: Module + 'static,
         F: Fn(&Npu) -> qanten::Result<M>,
     {
+        check_model_name(name)?;
         let replicas = self
             .pool
             .npus()
@@ -463,7 +493,8 @@ fn bad_request(msg: impl ToString) -> ApiError {
 }
 
 fn to_value(t: &JsonTensor, integer: bool) -> Result<OnnxValue, ApiError> {
-    let n: usize = t.shape.iter().product();
+    // Checked and capped: a shape is never trusted to be small or to fit usize.
+    let n = qanten::limits::elements(&t.shape).map_err(bad_request)?;
     if n != t.data.len() {
         return Err(bad_request(format!(
             "shape {:?} needs {n} values, got {}",
@@ -535,13 +566,19 @@ async fn infer(
     Json(req): Json<InferRequest>,
 ) -> Result<Json<InferResponse>, ApiError> {
     let start = Instant::now();
-    let entry = s
-        .models
-        .get(&name)
-        .cloned()
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no model named `{name}`")))?;
+    let entry = s.models.get(&name).cloned().ok_or_else(|| {
+        let shown: String = name.chars().take(64).collect();
+        ApiError(StatusCode::NOT_FOUND, format!("no model named `{shown}`"))
+    })?;
     entry.stats.requests.fetch_add(1, Ordering::Relaxed);
-    let result = infer_inner(&s, &entry, req).await;
+    let result =
+        match tokio::time::timeout(s.config.request_timeout, infer_inner(&s, &entry, req)).await {
+            Ok(r) => r,
+            Err(_) => Err(ApiError(
+                StatusCode::GATEWAY_TIMEOUT,
+                "inference timed out".into(),
+            )),
+        };
     entry
         .stats
         .latency_us
@@ -635,7 +672,7 @@ async fn metrics(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     let per_model = |f: &dyn Fn(&Stats) -> f64| -> Vec<(String, f64)> {
         s.models
             .iter()
-            .map(|(n, e)| (format!("{{model=\"{n}\"}}"), f(&e.stats)))
+            .map(|(n, e)| (format!("{{model=\"{}\"}}", label(n)), f(&e.stats)))
             .collect()
     };
     let load = |a: &AtomicU64| a.load(Ordering::Relaxed) as f64;
@@ -737,10 +774,12 @@ async fn metrics(State(s): State<Arc<AppState>>) -> impl IntoResponse {
 /// | POST | `/v1/models/{name}/infer` | run a model (JSON) |
 /// | GET | `/metrics` | Prometheus metrics |
 pub fn router(state: Arc<AppState>) -> Router {
+    let body_limit = axum::extract::DefaultBodyLimit::max(state.config.max_body_bytes);
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/models/{name}/infer", post(infer))
         .route("/metrics", get(metrics))
+        .layer(body_limit)
         .with_state(state)
 }

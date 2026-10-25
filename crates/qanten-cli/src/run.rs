@@ -97,6 +97,40 @@ fn describe(name: &str, t: &Tensor) {
     }
 }
 
+/// File names for model outputs: only `[A-Za-z0-9_-]` (names come from the
+/// model file, so no path separators or dots), at most 100 characters,
+/// never empty, and unique (`a.b` and `a_b` don't overwrite each other).
+fn output_file_names(names: &[&str]) -> Vec<String> {
+    let mut used = std::collections::HashSet::new();
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let mut base: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(100)
+                .collect();
+            if base.is_empty() {
+                base = format!("output_{i}");
+            }
+            let mut candidate = base.clone();
+            let mut k = 2;
+            while !used.insert(candidate.to_ascii_lowercase()) {
+                candidate = format!("{base}_{k}");
+                k += 1;
+            }
+            format!("{candidate}.npy")
+        })
+        .collect()
+}
+
 /// Settings for `qanten run`.
 pub struct RunArgs {
     pub model: PathBuf,
@@ -226,18 +260,14 @@ pub fn run(base: &Npu, args: RunArgs) -> Result<()> {
     }
     if let Some(dir) = &args.output_dir {
         std::fs::create_dir_all(dir)?;
-        for (name, t) in &outputs {
-            let safe: String = name
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            let path = dir.join(format!("{safe}.npy"));
+        let names: Vec<&str> = outputs.iter().map(|(n, _)| n.as_str()).collect();
+        for ((_, t), file) in outputs.iter().zip(output_file_names(&names)) {
+            let path = dir.join(file);
+            // Output names come from the model file: never write through a
+            // symlink someone placed in the output directory.
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+                bail!("refusing to write through the symlink {}", path.display());
+            }
             qanten::numpy::save_npy(&path, t)?;
             println!("  wrote {}", path.display());
         }
@@ -246,4 +276,37 @@ pub fn run(base: &Npu, args: RunArgs) -> Result<()> {
         println!("\n{}", profiler.report());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::output_file_names;
+
+    #[test]
+    fn output_names_are_safe_and_unique() {
+        let names = output_file_names(&[
+            "a.b",
+            "a_b",
+            "",
+            "../../etc/passwd",
+            "A_B",
+            &"x".repeat(300),
+        ]);
+        assert_eq!(
+            &names[..5],
+            [
+                "a_b.npy",
+                "a_b_2.npy",
+                "output_2.npy",
+                "______etc_passwd.npy",
+                "A_B_3.npy"
+            ]
+        );
+        assert!(names[5].len() <= 104);
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.contains('/') && !n.starts_with('.'))
+        );
+    }
 }

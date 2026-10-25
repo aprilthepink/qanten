@@ -8,7 +8,7 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, c_char, c_int};
 use std::sync::OnceLock;
 
 use qanten::backend::{Backend, DataRole, RawHandle, SimConfig, Simulator};
@@ -152,13 +152,19 @@ pub unsafe extern "C" fn qant_driver_allocate(
     id: u32,
     rows: usize,
     cols: usize,
-    role: QantDataRole,
+    // Taken as a plain integer: a C caller can pass any value, and turning
+    // an out-of-range one into a Rust enum would be undefined behaviour.
+    role: c_int,
     out: *mut QantDriverHandle,
 ) -> QantDriverError {
     let role = match role {
-        QantDataRole::Weights => DataRole::Weights,
-        QantDataRole::Features => DataRole::Features,
+        r if r == QantDataRole::Weights as c_int => DataRole::Weights,
+        r if r == QantDataRole::Features as c_int => DataRole::Features,
+        _ => return QantDriverError::new(-1, "invalid data role"),
     };
+    if out.is_null() {
+        return QantDriverError::new(-1, "null output handle");
+    }
     match sim().allocate(id, rows, cols, role) {
         Ok(h) => {
             if let Ok(mut l) = lens().lock() {

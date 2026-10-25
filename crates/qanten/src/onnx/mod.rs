@@ -31,6 +31,7 @@ use std::path::Path;
 
 use crate::device::Npu;
 use crate::error::{Error, Result};
+use crate::limits;
 use crate::nn::Module;
 use crate::ops::{
     self, Conv2dParams, ConvTranspose2dParams, ConvTransposeWeights, ConvWeights, LinearWeights,
@@ -227,14 +228,40 @@ fn strides(shape: &[usize]) -> Vec<usize> {
 
 fn axis(a: i64, rank: usize) -> Result<usize> {
     let r = rank as i64;
-    let v = if a < 0 { a + r } else { a };
-    if (0..r.max(1)).contains(&v) {
+    let v = if a < 0 { a.saturating_add(r) } else { a };
+    if (0..r).contains(&v) {
         Ok(v as usize)
     } else {
         Err(Error::Shape(format!(
             "axis {a} out of range for rank {rank}"
         )))
     }
+}
+
+/// The single value of a scalar (or first value of a tensor) input.
+fn scalar_f(node: &Node, v: &Val) -> Result<f32> {
+    v.to_f()
+        .data
+        .first()
+        .copied()
+        .ok_or_else(|| bad(node, "expected a scalar, got an empty tensor"))
+}
+
+/// Integer version of [`scalar_f`].
+fn scalar_i(node: &Node, v: &Val) -> Result<i64> {
+    v.to_i()
+        .0
+        .first()
+        .copied()
+        .ok_or_else(|| bad(node, "expected a scalar, got an empty tensor"))
+}
+
+/// Dimensions from an int tensor (`ConstantOfShape`, `Expand`): negative is an error.
+fn dims(node: &Node, values: &[i64]) -> Result<Vec<usize>> {
+    values
+        .iter()
+        .map(|&d| usize::try_from(d).map_err(|_| bad(node, format!("negative dimension {d}"))))
+        .collect()
 }
 
 fn broadcast_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
@@ -295,7 +322,7 @@ fn binary<T: Copy, U>(
     f: impl Fn(T, T) -> U,
 ) -> Result<(Vec<U>, Vec<usize>)> {
     let shape = broadcast_shape(sa, sb)?;
-    let n: usize = shape.iter().product();
+    let n = limits::elements(&shape)?;
     if sa == sb {
         return Ok((a.iter().zip(b).map(|(&x, &y)| f(x, y)).collect(), shape));
     }
@@ -464,7 +491,7 @@ impl OnnxModel {
                         Some(Resident::Conv(ConvWeights::upload(
                             &self.npu,
                             &w4.tensor()?,
-                            n.attr_i("group", 1) as usize,
+                            group(n)?,
                         )?))
                     }
                     None => None,
@@ -475,7 +502,7 @@ impl OnnxModel {
                         Some(Resident::ConvT(ConvTransposeWeights::upload(
                             &self.npu,
                             &w4.tensor()?,
-                            n.attr_i("group", 1) as usize,
+                            group(n)?,
                         )?))
                     }
                     None => None,
@@ -571,7 +598,16 @@ impl OnnxModel {
                     t.shape().to_vec(),
                 ),
                 OnnxValue::Float(t) => Val::F(Arr::from_tensor(t)),
-                OnnxValue::Int { data, shape } => Val::I(data.clone(), shape.clone()),
+                OnnxValue::Int { data, shape } => {
+                    if limits::elements(shape)? != data.len() {
+                        return Err(Error::Shape(format!(
+                            "input `{}`: {} values for shape {shape:?}",
+                            spec.name,
+                            data.len()
+                        )));
+                    }
+                    Val::I(data.clone(), shape.clone())
+                }
             };
             vals.insert(spec.name.clone(), v);
         }
@@ -634,6 +670,9 @@ impl OnnxModel {
             // ---- NPU-heavy ops
             "Gemm" => {
                 let mut a = f(0)?;
+                if a.shape.len() != 2 {
+                    return Err(bad(n, "A must be a matrix"));
+                }
                 if n.attr_i("transA", 0) == 1 {
                     let (d, s) = transpose_any(&a.data, &a.shape, &[1, 0]);
                     a = Arr::new(d, s);
@@ -642,6 +681,9 @@ impl OnnxModel {
                     Some(Resident::Linear(lw)) => lw.forward(&a.tensor()?)?,
                     _ => {
                         let b = f(1)?;
+                        if b.shape.len() != 2 {
+                            return Err(bad(n, "B must be a matrix"));
+                        }
                         let m = if n.attr_i("transB", 0) == 1 {
                             b
                         } else {
@@ -700,7 +742,7 @@ impl OnnxModel {
             }
             "Mul" => match (input(0)?, input(1)?) {
                 (Val::I(a, sa), Val::I(b, sb)) => {
-                    let (d, s) = binary(a, sa, b, sb, |x, y| x * y)?;
+                    let (d, s) = binary(a, sa, b, sb, i64::wrapping_mul)?;
                     one(Val::I(d, s))
                 }
                 (x, y) if x.shape() == y.shape() && x.shape().iter().product::<usize>() >= 64 => {
@@ -718,17 +760,12 @@ impl OnnxModel {
             "Add" | "Sub" | "Div" | "Pow" => {
                 let (x, y) = (input(0)?, input(1)?);
                 if let (Val::I(a, sa), Val::I(b, sb)) = (x, y) {
+                    // Wrapping like ONNX runtimes; division by 0 (and MIN / -1) gives 0.
                     let (d, s) = binary(a, sa, b, sb, |p, q| match op {
-                        "Add" => p + q,
-                        "Sub" => p - q,
-                        "Div" => {
-                            if q == 0 {
-                                0
-                            } else {
-                                p / q
-                            }
-                        }
-                        _ => p.pow(q.max(0) as u32),
+                        "Add" => p.wrapping_add(q),
+                        "Sub" => p.wrapping_sub(q),
+                        "Div" => p.checked_div(q).unwrap_or(0),
+                        _ => p.wrapping_pow(q.clamp(0, u32::MAX as i64) as u32),
                     })?;
                     return one(Val::I(d, s));
                 }
@@ -832,9 +869,13 @@ impl OnnxModel {
                 let (lo, hi) = if self.opset >= 11 {
                     (
                         opt(1)
-                            .map(|v| v.to_f().data[0])
+                            .map(|v| scalar_f(n, v))
+                            .transpose()?
                             .unwrap_or(f32::NEG_INFINITY),
-                        opt(2).map(|v| v.to_f().data[0]).unwrap_or(f32::INFINITY),
+                        opt(2)
+                            .map(|v| scalar_f(n, v))
+                            .transpose()?
+                            .unwrap_or(f32::INFINITY),
                     )
                 } else {
                     (
@@ -842,7 +883,7 @@ impl OnnxModel {
                         n.attr_f("max", f32::INFINITY),
                     )
                 };
-                unary(&|x| x.clamp(lo, hi))
+                unary(&|x| x.max(lo).min(hi)) // ONNX semantics; never panics on lo > hi or NaN
             }
             "Identity" | "Dropout" => one(input(0)?.clone()),
             // ---- normalisation
@@ -889,6 +930,9 @@ impl OnnxModel {
                 let eps = n.attr_f("epsilon", 1e-5);
                 let scale = f(1)?;
                 let bias = opt(2).map(Val::to_f);
+                if scale.data.is_empty() || bias.as_ref().is_some_and(|b| b.data.is_empty()) {
+                    return Err(bad(n, "scale and bias must not be empty"));
+                }
                 let mut y = x.data.clone();
                 for row in y.chunks_mut(len.max(1)) {
                     let m = row.iter().sum::<f32>() / len as f32;
@@ -975,10 +1019,11 @@ impl OnnxModel {
                     }
                 }
                 if let Some(k) = infer {
-                    let known: usize = shape.iter().product();
+                    let known =
+                        Tensor::checked_numel(&shape).ok_or_else(|| bad(n, "shape overflows"))?;
                     shape[k] = total.checked_div(known).unwrap_or(0);
                 }
-                if shape.iter().product::<usize>() != total {
+                if Tensor::checked_numel(&shape) != Some(total) {
                     return Err(bad(
                         n,
                         format!("cannot reshape {:?} to {shape:?}", v.shape()),
@@ -993,6 +1038,13 @@ impl OnnxModel {
                     Some(p) => p.iter().map(|&a| axis(a, r)).collect::<Result<_>>()?,
                     None => (0..r).rev().collect(),
                 };
+                let mut seen = vec![false; r];
+                if perm.len() != r || perm.iter().any(|&p| std::mem::replace(&mut seen[p], true)) {
+                    return Err(bad(
+                        n,
+                        format!("perm {perm:?} is not a permutation of rank {r}"),
+                    ));
+                }
                 one(match v {
                     Val::F(a) => {
                         let (d, s) = transpose_any(&a.data, &a.shape, &perm);
@@ -1019,6 +1071,9 @@ impl OnnxModel {
                     } else {
                         axes.iter().map(|&a| axis(a, r)).collect::<Result<_>>()?
                     };
+                    if drop.iter().any(|&k| shape[k] != 1) {
+                        return Err(bad(n, "can only squeeze dimensions of size 1"));
+                    }
                     shape = shape
                         .iter()
                         .enumerate()
@@ -1071,7 +1126,22 @@ impl OnnxModel {
                     .map(|x| x.to_i().0)
                     .or_else(|| n.attr_ints("split").map(<[i64]>::to_vec))
                 {
-                    Some(sz) => sz.iter().map(|&x| x as usize).collect(),
+                    Some(sz) => {
+                        let sizes: Vec<usize> = sz
+                            .iter()
+                            .map(|&x| {
+                                usize::try_from(x)
+                                    .map_err(|_| bad(n, format!("negative split size {x}")))
+                            })
+                            .collect::<Result<_>>()?;
+                        if sizes.iter().try_fold(0usize, |a, &b| a.checked_add(b)) != Some(s[ax]) {
+                            return Err(bad(
+                                n,
+                                format!("split sizes {sizes:?} do not add up to {}", s[ax]),
+                            ));
+                        }
+                        sizes
+                    }
                     None => {
                         let base = s[ax].div_ceil(outs.max(1));
                         (0..outs)
@@ -1110,15 +1180,27 @@ impl OnnxModel {
                     )
                 };
                 let axes = axes.unwrap_or_else(|| (0..starts.len() as i64).collect());
+                let k_len = starts.len();
+                if ends.len() != k_len
+                    || axes.len() != k_len
+                    || steps.as_ref().is_some_and(|st| st.len() != k_len)
+                {
+                    return Err(bad(
+                        n,
+                        "starts, ends, axes and steps must have the same length",
+                    ));
+                }
                 let mut cur = v.clone();
-                for k in 0..starts.len() {
+                for k in 0..k_len {
                     let ax = axis(axes[k], s.len())?;
                     let step = steps.as_ref().map_or(1, |st| st[k]);
                     if step <= 0 {
                         return Err(unsupported(n, "non-positive steps"));
                     }
                     let dim = s[ax] as i64;
-                    let clamp = |x: i64| (if x < 0 { x + dim } else { x }).clamp(0, dim) as usize;
+                    let clamp = |x: i64| {
+                        (if x < 0 { x.saturating_add(dim) } else { x }).clamp(0, dim) as usize
+                    };
                     cur = slice_val(&cur, ax, clamp(starts[k]), clamp(ends[k]), step as usize)?;
                 }
                 one(cur)
@@ -1134,10 +1216,11 @@ impl OnnxModel {
                 let mut out_shape = s[..ax].to_vec();
                 out_shape.extend(&idx_s);
                 out_shape.extend(&s[ax + 1..]);
+                limits::elements(&out_shape)?;
                 let positions: Vec<usize> = idx_v
                     .iter()
                     .map(|&i| {
-                        let j = if i < 0 { i + dim } else { i };
+                        let j = if i < 0 { i.saturating_add(dim) } else { i };
                         if (0..dim).contains(&j) {
                             Ok(j as usize)
                         } else {
@@ -1166,10 +1249,10 @@ impl OnnxModel {
             }
             "Expand" => {
                 let v = input(0)?;
-                let target: Vec<usize> = ints(1)?.iter().map(|&d| d.max(0) as usize).collect();
+                let target = dims(n, &ints(1)?)?;
                 let shape = broadcast_shape(v.shape(), &target)?;
+                let total = limits::elements(&shape)?;
                 let map = broadcast_index(&shape, v.shape());
-                let total: usize = shape.iter().product();
                 one(match v {
                     Val::F(a) => Val::F(Arr::new(
                         (0..total).map(|i| a.data[map(i)]).collect(),
@@ -1181,7 +1264,8 @@ impl OnnxModel {
             "Shape" => {
                 let s = input(0)?.shape();
                 let r = s.len() as i64;
-                let norm = |x: i64| (if x < 0 { x + r } else { x }).clamp(0, r) as usize;
+                let norm =
+                    |x: i64| (if x < 0 { x.saturating_add(r) } else { x }).clamp(0, r) as usize;
                 let start = norm(n.attr_i("start", 0));
                 let end = norm(n.attr_i("end", r));
                 let d: Vec<i64> = s[start..end.max(start)].iter().map(|&x| x as i64).collect();
@@ -1207,31 +1291,44 @@ impl OnnxModel {
                 Err(unsupported(n, "this kind of constant"))
             }
             "ConstantOfShape" => {
-                let shape: Vec<usize> = ints(0)?.iter().map(|&d| d.max(0) as usize).collect();
-                let total = shape.iter().product();
+                let shape = dims(n, &ints(0)?)?;
+                let total = limits::elements(&shape)?;
+                let fill = |t: &proto::TensorProto| -> Result<f64> {
+                    t.to_f64()?
+                        .first()
+                        .copied()
+                        .ok_or_else(|| bad(n, "empty value tensor"))
+                };
                 match n.attr("value").and_then(|a| a.t.as_ref()) {
-                    Some(t) if t.is_integer() => {
-                        one(Val::I(vec![t.to_f64()?[0] as i64; total], shape))
-                    }
-                    Some(t) => one(Val::F(Arr::new(vec![t.to_f64()?[0] as f32; total], shape))),
+                    Some(t) if t.is_integer() => one(Val::I(vec![fill(t)? as i64; total], shape)),
+                    Some(t) => one(Val::F(Arr::new(vec![fill(t)? as f32; total], shape))),
                     None => one(Val::F(Arr::new(vec![0.0; total], shape))),
                 }
             }
             "Range" => {
                 let (st, li, de) = (input(0)?, input(1)?, input(2)?);
-                if let (Val::I(a, _), Val::I(b, _), Val::I(c, _)) = (st, li, de) {
-                    let (a, b, c) = (a[0], b[0], c[0]);
+                if let (Val::I(..), Val::I(..), Val::I(..)) = (st, li, de) {
+                    let (a, b, c) = (scalar_i(n, st)?, scalar_i(n, li)?, scalar_i(n, de)?);
                     if c == 0 {
                         return Err(bad(n, "delta is 0"));
                     }
-                    let d: Vec<i64> = std::iter::successors(Some(a), |&x| Some(x + c))
-                        .take_while(|&x| if c > 0 { x < b } else { x > b })
+                    // ceil((b − a) / c) in i128, so no step can overflow.
+                    let (span, step) = ((b as i128) - (a as i128), c as i128);
+                    let count = ((span + step - step.signum()) / step).max(0) as u128;
+                    let len = usize::try_from(count).map_err(|_| bad(n, "range too long"))?;
+                    limits::elements(&[len])?;
+                    let d: Vec<i64> = (0..len as i64)
+                        .map(|k| a.wrapping_add(k.wrapping_mul(c)))
                         .collect();
-                    let len = d.len();
                     return one(Val::I(d, vec![len]));
                 }
-                let (a, b, c) = (st.to_f().data[0], li.to_f().data[0], de.to_f().data[0]);
-                let count = ((b - a) / c).ceil().max(0.0) as usize;
+                let (a, b, c) = (scalar_f(n, st)?, scalar_f(n, li)?, scalar_f(n, de)?);
+                let count = ((b - a) / c).ceil();
+                if !count.is_finite() {
+                    return Err(bad(n, "range length is not finite"));
+                }
+                let count = count.max(0.0) as usize;
+                limits::elements(&[count])?;
                 one(Val::F(Arr::new(
                     (0..count).map(|k| a + k as f32 * c).collect(),
                     vec![count],
@@ -1284,6 +1381,9 @@ impl OnnxModel {
 
     /// Batched matmul with numpy broadcasting; every product runs on the NPU.
     fn matmul_general(&self, a: &Arr, b: &Arr) -> Result<Arr> {
+        if a.shape.is_empty() || b.shape.is_empty() {
+            return Err(Error::Shape("MatMul: operands must have rank ≥ 1".into()));
+        }
         let a_vec = a.shape.len() == 1;
         let b_vec = b.shape.len() == 1;
         let sa = if a_vec {
@@ -1305,6 +1405,9 @@ impl OnnxModel {
             )));
         }
         let batch = broadcast_shape(&sa[..sa.len() - 2], &sb[..sb.len() - 2])?;
+        let mut out_shape = batch.clone();
+        out_shape.extend([m, nn]);
+        limits::elements(&out_shape)?;
         let nb: usize = batch.iter().product();
         let ia = broadcast_index(&batch, &sa[..sa.len() - 2]);
         let ib = broadcast_index(&batch, &sb[..sb.len() - 2]);
@@ -1349,7 +1452,7 @@ impl OnnxModel {
             .stride((strides[0], strides[1]))
             .dilation((dil[0], dil[1]))
             .padding(padding)
-            .groups(n.attr_i("group", 1) as usize);
+            .groups(group(n)?);
         let Some(Resident::Conv(weights)) = self.resident.get(&idx) else {
             return Err(unsupported(n, "weights that are not constants in the file"));
         };
@@ -1373,11 +1476,16 @@ impl OnnxModel {
         let Some(Resident::ConvT(weights)) = self.resident.get(&idx) else {
             return Err(unsupported(n, "weights that are not constants in the file"));
         };
-        let pads = n.attr_ints("pads").map(<[i64]>::to_vec).unwrap_or_default();
+        let pads: Vec<usize> = n
+            .attr_ints("pads")
+            .unwrap_or_default()
+            .iter()
+            .map(|&p| window_value(n, "pads", p, 0))
+            .collect::<Result<_>>()?;
         let pads: Vec<usize> = if one_d && pads.len() == 2 {
-            vec![0, pads[0] as usize, 0, pads[1] as usize]
+            vec![0, pads[0], 0, pads[1]]
         } else {
-            pads.iter().map(|&p| p as usize).collect()
+            pads
         };
         if pads.len() == 4 && (pads[0] != pads[2] || pads[1] != pads[3]) {
             return Err(unsupported(n, "asymmetric pads"));
@@ -1400,7 +1508,7 @@ impl OnnxModel {
             .padding(pad)
             .output_padding((op[0], op[1]))
             .dilation((d[0], d[1]))
-            .groups(n.attr_i("group", 1) as usize);
+            .groups(group(n)?);
         let mut y = weights.forward(&x4.tensor()?, &params)?;
         if let Some(b) = bias {
             y = ops::add_channel_bias(&y, &b.tensor()?)?;
@@ -1430,17 +1538,23 @@ fn reshape_val(v: &Val, shape: Vec<usize>) -> Val {
 }
 
 fn concat<T: Copy>(parts: &[(Vec<T>, Vec<usize>)], ax: usize) -> Result<(Vec<T>, Vec<usize>)> {
-    let first = &parts[0].1;
+    let first = &parts
+        .first()
+        .ok_or_else(|| Error::Shape("Concat: no inputs".into()))?
+        .1;
     let outer: usize = first[..ax].iter().product();
-    let mut shape = first.clone();
-    shape[ax] = parts.iter().map(|p| p.1[ax]).sum();
     for p in parts {
         if p.1.len() != first.len() || p.1[..ax] != first[..ax] || p.1[ax + 1..] != first[ax + 1..]
         {
             return Err(Error::Shape(format!("Concat: {:?} vs {first:?}", p.1)));
         }
     }
-    let mut out = Vec::with_capacity(shape.iter().product());
+    let mut shape = first.clone();
+    shape[ax] = parts
+        .iter()
+        .try_fold(0usize, |acc, p| acc.checked_add(p.1[ax]))
+        .ok_or_else(|| Error::Shape("Concat: size overflows".into()))?;
+    let mut out = Vec::with_capacity(limits::elements(&shape)?);
     for o in 0..outer {
         for (data, s) in parts {
             let chunk: usize = s[ax..].iter().product();
@@ -1536,13 +1650,40 @@ fn to_4d_input(x: &Arr, n: &Node) -> Result<Arr> {
     }
 }
 
-/// `(h, w)` from a 1- or 2-element attribute (default 1).
+/// The `group` attribute (default 1), which must be positive.
+fn group(n: &Node) -> Result<usize> {
+    let g = n.attr_i("group", 1);
+    usize::try_from(g)
+        .ok()
+        .filter(|&g| g > 0)
+        .ok_or_else(|| bad(n, format!("group must be positive, got {g}")))
+}
+
+/// Largest kernel size, stride, dilation or pad accepted from a model.
+const MAX_WINDOW: i64 = 1 << 16;
+
+/// A spatial attribute value in `min..=MAX_WINDOW`.
+fn window_value(n: &Node, name: &str, v: i64, min: i64) -> Result<usize> {
+    if (min..=MAX_WINDOW).contains(&v) {
+        Ok(v as usize)
+    } else {
+        Err(bad(
+            n,
+            format!("{name} value {v} must be in {min}..={MAX_WINDOW}"),
+        ))
+    }
+}
+
+/// `(h, w)` from a 1- or 2-element attribute (default 1); kernel sizes,
+/// strides and dilations must be ≥ 1, `output_padding` ≥ 0.
 fn attr_pair(n: &Node, name: &str, one_d: bool) -> Result<[usize; 2]> {
+    let min = if name == "output_padding" { 0 } else { 1 };
+    let v = |x: i64| window_value(n, name, x, min);
     match n.attr_ints(name) {
         None => Ok([1, 1]),
-        Some([v]) if one_d => Ok([1, *v as usize]),
-        Some([a, b]) => Ok([*a as usize, *b as usize]),
-        Some(v) => Err(unsupported(n, format!("{name}={v:?}"))),
+        Some([x]) if one_d => Ok([1, v(*x)?]),
+        Some([a, b]) => Ok([v(*a)?, v(*b)?]),
+        Some(other) => Err(unsupported(n, format!("{name}={other:?}"))),
     }
 }
 
@@ -1556,12 +1697,15 @@ fn conv_pads(
     d: [usize; 2],
 ) -> Result<[usize; 4]> {
     match n.attr_s("auto_pad").unwrap_or("NOTSET") {
-        "NOTSET" | "" => match n.attr_ints("pads") {
-            None => Ok([0; 4]),
-            Some([b, e]) if one_d => Ok([0, *b as usize, 0, *e as usize]),
-            Some([t, l, b, r]) => Ok([*t as usize, *l as usize, *b as usize, *r as usize]),
-            Some(p) => Err(unsupported(n, format!("pads={p:?}"))),
-        },
+        "NOTSET" | "" => {
+            let pad = |x: i64| window_value(n, "pads", x, 0);
+            match n.attr_ints("pads") {
+                None => Ok([0; 4]),
+                Some([b, e]) if one_d => Ok([0, pad(*b)?, 0, pad(*e)?]),
+                Some([t, l, b, r]) => Ok([pad(*t)?, pad(*l)?, pad(*b)?, pad(*r)?]),
+                Some(p) => Err(unsupported(n, format!("pads={p:?}"))),
+            }
+        }
         "VALID" => Ok([0; 4]),
         mode @ ("SAME_UPPER" | "SAME_LOWER") => {
             let total = |i: usize| {
@@ -1590,7 +1734,7 @@ fn apply_pads(x: &Arr, p: [usize; 4]) -> Result<(Arr, (usize, usize))> {
     }
     let [nb, c, h, w] = [x.shape[0], x.shape[1], x.shape[2], x.shape[3]];
     let (nh, nw) = (h + p[0] + p[2], w + p[1] + p[3]);
-    let mut out = vec![0.0f32; nb * c * nh * nw];
+    let mut out = vec![0.0f32; limits::elements(&[nb, c, nh, nw])?];
     for plane in 0..nb * c {
         for y in 0..h {
             let src = &x.data[(plane * h + y) * w..][..w];
@@ -1611,7 +1755,7 @@ fn pool(n: &Node, x: &Arr, max: bool) -> Result<Arr> {
     let include_pad = n.attr_i("count_include_pad", 0) == 1;
     let oh = (h + p[0] + p[2]).saturating_sub(k[0]) / s[0] + 1;
     let ow = (w + p[1] + p[3]).saturating_sub(k[1]) / s[1] + 1;
-    let mut out = Vec::with_capacity(nb * c * oh * ow);
+    let mut out = Vec::with_capacity(limits::elements(&[nb, c, oh, ow])?);
     for plane in 0..nb * c {
         let src = &x4.data[plane * h * w..][..h * w];
         for oy in 0..oh {

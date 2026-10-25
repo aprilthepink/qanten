@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use half::bf16;
 use rayon::prelude::*;
 
-use super::{Backend, BackendKind, DataRole, NpuEntry, RawHandle, check_len};
+use super::{Backend, BackendKind, DataRole, NpuEntry, RawHandle, check_len, checked_size};
 use crate::error::{Error, Result};
 use crate::info::{DeviceInfo, PerfCounters, SensorReadings, VersionInfo};
 use crate::rng::SplitMix64;
@@ -245,7 +245,12 @@ impl Backend for Simulator {
         cols: usize,
     ) -> Result<()> {
         self.check_npu(npu)?;
-        check_len(npu, "matrix", matrix.len(), rows * cols)?;
+        check_len(
+            npu,
+            "matrix",
+            matrix.len(),
+            checked_size(npu, "matrix", rows, cols)?,
+        )?;
         if cols == 0 || !vectors.len().is_multiple_of(cols) {
             return Err(Error::Shape(format!(
                 "vector batch of {} values is not a multiple of {cols} columns",
@@ -253,7 +258,12 @@ impl Backend for Simulator {
             )));
         }
         let n_vecs = vectors.len() / cols;
-        check_len(npu, "matvec output", out.len(), n_vecs * rows)?;
+        check_len(
+            npu,
+            "matvec output",
+            out.len(),
+            checked_size(npu, "matvec output", n_vecs, rows)?,
+        )?;
         self.timed(npu, || matvec(matrix, vectors, out, rows, cols));
         self.add_noise(out);
         Ok(())
@@ -267,12 +277,13 @@ impl Backend for Simulator {
         let mut store = lock(&self.store);
         if let Some(limit) = self.config.memory_limit_bytes {
             let used = Self::used_bytes(&store, npu);
-            if used + len * 2 > limit {
+            let wanted = len.checked_mul(2).and_then(|b| b.checked_add(used));
+            if wanted.is_none_or(|total| total > limit) {
                 return Err(sim_err(
                     npu,
                     format!(
                         "out of device memory: {used} of {limit} bytes used, {} requested",
-                        len * 2
+                        len.saturating_mul(2)
                     ),
                 ));
             }

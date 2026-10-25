@@ -187,7 +187,7 @@ impl TensorProto {
                 self.name
             )));
         }
-        let n: usize = self.shape()?.iter().product();
+        let n = crate::limits::elements(&self.shape()?)?;
         let raw = &self.raw;
         let from_raw = |size: usize, f: &dyn Fn(&[u8]) -> f64| -> Vec<f64> {
             raw.chunks_exact(size).map(f).collect()

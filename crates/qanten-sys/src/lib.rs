@@ -278,6 +278,9 @@ pub type GetPerfCounterFn =
 pub enum LoadError {
     /// No candidate path could be opened. Holds every attempt and its error.
     NotFound(Vec<(OsString, libloading::Error)>),
+    /// `QANTEN_DRIVER_LIB` is a relative path with directories; use an
+    /// absolute path or a bare library name.
+    RelativePath(OsString),
     /// The library opened but a required symbol is missing (driver too old?).
     MissingSymbol {
         /// Library that was opened.
@@ -305,6 +308,11 @@ impl fmt::Display for LoadError {
                 }
                 Ok(())
             }
+            LoadError::RelativePath(path) => write!(
+                f,
+                "{DRIVER_LIB_ENV}={} is a relative path; use an absolute path (or a bare library name for the system search path)",
+                path.to_string_lossy()
+            ),
             LoadError::MissingSymbol {
                 path,
                 symbol,
@@ -321,7 +329,7 @@ impl fmt::Display for LoadError {
 impl std::error::Error for LoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            LoadError::NotFound(_) => None,
+            LoadError::NotFound(_) | LoadError::RelativePath(_) => None,
             LoadError::MissingSymbol { source, .. } => Some(source),
         }
     }
@@ -333,40 +341,95 @@ impl std::error::Error for LoadError {
 /// because it owns the [`libloading::Library`].
 pub struct DriverLibrary {
     path: OsString,
-    /// See [`InitNpuFn`].
-    pub init_npu: InitNpuFn,
-    /// See [`ReleaseNpuFn`].
-    pub release_npu: ReleaseNpuFn,
-    /// See [`SetupLoggingFn`].
-    pub setup_logging: SetupLoggingFn,
-    /// See [`MulNpuFn`].
-    pub mul_npu: MulNpuFn,
-    /// See [`MulMatrixVecBatchedFn`].
-    pub mul_matrix_vec_batched: MulMatrixVecBatchedFn,
-    /// See [`ScaledPeriodicNlFn`].
-    pub scaled_periodic_nl_npu: ScaledPeriodicNlFn,
-    /// See [`AllocateFn`].
-    pub allocate: AllocateFn,
-    /// See [`FreeFn`].
-    pub free: FreeFn,
-    /// See [`UploadFn`].
-    pub upload: UploadFn,
-    /// See [`DownloadFn`].
-    pub download: DownloadFn,
-    /// See [`MulMatrixVecBatchedMemFn`].
-    pub mul_matrix_vec_batched_mem: MulMatrixVecBatchedMemFn,
-    /// See [`GetVersionFn`].
-    pub get_version: GetVersionFn,
-    /// See [`GetDeviceInfoFn`].
-    pub get_device_info: GetDeviceInfoFn,
-    /// See [`GetAvailableNpusFn`].
-    pub get_available_npus: GetAvailableNpusFn,
-    /// See [`ResetPerfCounterFn`].
-    pub reset_perf_counter: ResetPerfCounterFn,
-    /// See [`GetPerfCounterFn`].
-    pub get_perf_counter: GetPerfCounterFn,
+    init_npu: InitNpuFn,
+    release_npu: ReleaseNpuFn,
+    setup_logging: SetupLoggingFn,
+    mul_npu: MulNpuFn,
+    mul_matrix_vec_batched: MulMatrixVecBatchedFn,
+    scaled_periodic_nl_npu: ScaledPeriodicNlFn,
+    allocate: AllocateFn,
+    free: FreeFn,
+    upload: UploadFn,
+    download: DownloadFn,
+    mul_matrix_vec_batched_mem: MulMatrixVecBatchedMemFn,
+    get_version: GetVersionFn,
+    get_device_info: GetDeviceInfoFn,
+    get_available_npus: GetAvailableNpusFn,
+    reset_perf_counter: ResetPerfCounterFn,
+    get_perf_counter: GetPerfCounterFn,
     // Must be dropped last; keeps the function pointers above valid.
     _lib: libloading::Library,
+}
+
+/// Generates one `unsafe fn` per driver entry point. The function pointers
+/// themselves stay private, so they can only be called through a live
+/// `DriverLibrary` (never after the library was unloaded).
+macro_rules! entry_points {
+    ($( $(#[$doc:meta])* $name:ident ( $($arg:ident : $ty:ty),* ) -> $ret:ty; )*) => {
+        impl DriverLibrary {
+            $(
+                $(#[$doc])*
+                ///
+                /// # Safety
+                /// The arguments must satisfy the driver's contract for this
+                /// call (valid pointers with the lengths the driver derives
+                /// from the other arguments or the allocation, live handles).
+                #[allow(clippy::too_many_arguments)] // mirrors the C signature
+                pub unsafe fn $name(&self, $($arg: $ty),*) -> $ret {
+                    // SAFETY: forwarded to the caller; `self` keeps the library loaded.
+                    unsafe { (self.$name)($($arg),*) }
+                }
+            )*
+        }
+    };
+}
+
+entry_points! {
+    /// See [`InitNpuFn`].
+    init_npu(npu_id: u32) -> QantDriverError;
+    /// See [`ReleaseNpuFn`].
+    release_npu(npu_id: u32) -> QantDriverError;
+    /// See [`SetupLoggingFn`].
+    setup_logging(folder_name: *const c_char, loglevel: i32) -> QantDriverError;
+    /// See [`MulNpuFn`].
+    mul_npu(npu_id: u32, us: *const bf16, vs: *const bf16, output: *mut bf16, len: usize) -> QantDriverError;
+    /// See [`MulMatrixVecBatchedFn`].
+    mul_matrix_vec_batched(
+        npu_id: u32,
+        matrix: *const bf16,
+        vector_batch: *const bf16,
+        output: *mut bf16,
+        n_rows: usize,
+        n_cols: usize,
+        n_vecs: usize
+    ) -> QantDriverError;
+    /// See [`ScaledPeriodicNlFn`].
+    scaled_periodic_nl_npu(npu_id: u32, us: *const bf16, vs: *const bf16, output: *mut bf16, len: usize) -> QantDriverError;
+    /// See [`AllocateFn`].
+    allocate(npu_id: u32, rows: usize, cols: usize, role: QantDataRole, out: *mut QantDriverHandle) -> QantDriverError;
+    /// See [`FreeFn`].
+    free(handle: QantDriverHandle) -> QantDriverError;
+    /// See [`UploadFn`].
+    upload(handle: QantDriverHandle, data: *const bf16) -> QantDriverError;
+    /// See [`DownloadFn`].
+    download(handle: QantDriverHandle, output: *mut bf16) -> QantDriverError;
+    /// See [`MulMatrixVecBatchedMemFn`].
+    mul_matrix_vec_batched_mem(matrix: QantDriverHandle, vectors: QantDriverHandle, result: QantDriverHandle) -> QantDriverError;
+    /// See [`GetVersionFn`].
+    get_version(npu_id: u32, output: *mut c_char, len: usize) -> QantDriverError;
+    /// See [`GetDeviceInfoFn`].
+    get_device_info(npu_id: u32) -> QantDeviceInfo;
+    /// See [`GetAvailableNpusFn`].
+    get_available_npus(
+        idxs_out: *mut u32,
+        serials_out: *mut [c_char; C_STRING_DEFAULT_LENGTH],
+        capacity: usize,
+        out_count: *mut usize
+    ) -> QantDriverError;
+    /// See [`ResetPerfCounterFn`].
+    reset_perf_counter(npu_id: u32) -> QantDriverError;
+    /// See [`GetPerfCounterFn`].
+    get_perf_counter(npu_id: u32, out: *mut PerformanceCounterInfo) -> QantDriverError;
 }
 
 impl fmt::Debug for DriverLibrary {
@@ -387,6 +450,13 @@ impl DriverLibrary {
     pub unsafe fn load() -> Result<Self, LoadError> {
         let mut candidates: Vec<OsString> = Vec::new();
         if let Some(path) = std::env::var_os(DRIVER_LIB_ENV).filter(|p| !p.is_empty()) {
+            // A bare file name goes through the system loader's search path
+            // (as intended); a relative path with directories would resolve
+            // against whatever the current directory happens to be.
+            let p = Path::new(&path);
+            if p.is_relative() && p.components().count() > 1 {
+                return Err(LoadError::RelativePath(path));
+            }
             candidates.push(path);
         }
         candidates.extend(DEFAULT_LIBRARY_NAMES.iter().map(OsString::from));

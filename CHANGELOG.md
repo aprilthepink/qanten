@@ -27,6 +27,25 @@ official toolkit v2.4.0.
   on `qanten::compute` (covariance via `gemm`, resident `NpuMatrix` scoring,
   daily `check_product` NPU self-check); a cavitation fault the classifier
   never sees; two new features (band energy, envelope floor).
+- Security hardening (from a dedicated security review):
+  - `qanten::limits` caps tensor size (2²⁸ elements) and rank (32). Every
+    loader uses it: ONNX, npy/npz (decompression is capped too, so zip bombs
+    fail) and safetensors. All size arithmetic is checked.
+  - ONNX: hostile attributes are rejected with errors instead of panicking:
+    zero strides, negative pads, bad permutations, out-of-range slices and
+    splits, and `Clip` with min > max. Integer ops wrap instead of
+    overflowing. A mutation fuzz test checks that corrupted models never
+    panic.
+  - Driver backend: a handle can no longer be freed while another thread
+    uses it in an FFI call. `matvec_resident` checks NPU, roles and shapes
+    before calling the driver.
+  - `qanten-sys`: function-pointer fields are private and are called through
+    `unsafe fn` methods. A relative `QANTEN_DRIVER_LIB` path with several
+    components is refused.
+  - `qanten-serve`: request body limit (`--max-body-mb`), inference timeout
+    (`--timeout-s`), restricted model names, and escaped Prometheus labels.
+  - `qanten run`: output file names are sanitised and deduplicated, and it
+    refuses to write through symlinks.
 - `NpuExecutor`: a job's in-flight count drops before its result is
   published, so `queue_depths()` is never stale right after `wait()`.
 - `compute::NpuMatrix::upload_replicated`: a full copy per NPU with batches
