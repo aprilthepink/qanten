@@ -12,7 +12,8 @@
 //! 4. Each spectrum is resampled from Hz to *shaft orders*, so the same fault
 //!    looks the same at 900 rpm and at 2700 rpm.
 //!
-//! Plus three time-domain statistics: RMS, crest factor and kurtosis.
+//! Plus five statistics: RMS, crest factor, kurtosis and energy of the
+//! resonance band, and the envelope spectrum's noise floor (its median).
 
 use qanten::signal::{Dft, FirBank, design, hann};
 use qanten::{Npu, Result};
@@ -30,7 +31,8 @@ const SPEED_ORDERS: usize = 40;
 const ENVELOPE_ORDERS: usize = 47;
 
 /// Length of the feature vector.
-pub const NUM_FEATURES: usize = SPEED_ORDERS + ENVELOPE_ORDERS + 3;
+pub const NUM_FEATURES: usize = SPEED_ORDERS + ENVELOPE_ORDERS + STATS;
+const STATS: usize = 5;
 
 /// Turns raw windows into feature vectors on one NPU.
 #[derive(Debug)]
@@ -116,6 +118,10 @@ impl FeatureExtractor {
                 }
             }
             out.extend(stats[i]);
+            // Envelope noise floor: median bin (bearing faults add peaks; broadband faults raise it).
+            let mut sorted: Vec<f32> = env[1..].to_vec();
+            sorted.sort_by(f32::total_cmp);
+            out.push((sorted[sorted.len() / 2] * to_amplitude + 1e-5).log10());
         }
         Ok(out)
     }
@@ -129,8 +135,8 @@ fn order_peak(spec: &[f32], order: f32, shaft_hz: f32, bin_hz: f32) -> f32 {
     spec[lo.min(hi)..=hi].iter().copied().fold(0.0, f32::max)
 }
 
-/// `[log10 RMS, log10 crest factor, log10 kurtosis of the resonance band]`.
-fn time_stats(signal: &[f32], resonance: &[f32]) -> [f32; 3] {
+/// `[log10 RMS, log10 crest factor, log10 kurtosis and log10 RMS of the resonance band]`.
+fn time_stats(signal: &[f32], resonance: &[f32]) -> [f32; 4] {
     let n = signal.len() as f32;
     let mean = signal.iter().sum::<f32>() / n;
     let rms = (signal.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n).sqrt();
@@ -142,6 +148,7 @@ fn time_stats(signal: &[f32], resonance: &[f32]) -> [f32; 3] {
         (rms + 1e-6).log10(),
         (peak / rms.max(1e-6)).log10(),
         kurtosis.max(1e-3).log10(),
+        (var.sqrt() + 1e-6).log10(),
     ]
 }
 
@@ -154,6 +161,15 @@ pub fn feature_names() -> Vec<String> {
     for k in 0..ENVELOPE_ORDERS {
         names.push(format!("envelope {:.2}x", (2 + k) as f32 * ORDER_STEP));
     }
-    names.extend(["log rms", "log crest", "log kurtosis"].map(String::from));
+    names.extend(
+        [
+            "log rms",
+            "log crest",
+            "log kurtosis",
+            "log band rms",
+            "log envelope floor",
+        ]
+        .map(String::from),
+    );
     names
 }

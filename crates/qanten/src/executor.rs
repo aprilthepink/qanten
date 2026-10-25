@@ -37,7 +37,10 @@ use crate::nn::Module;
 use crate::pool::NpuPool;
 use crate::tensor::Tensor;
 
-type Job = Box<dyn FnOnce(&Npu) + Send + 'static>;
+/// A queued job; gets the worker's NPU and its in-flight counter, which it
+/// decrements before publishing the result (so `queue_depths` is never stale
+/// once a caller has the result).
+type Job = Box<dyn FnOnce(&Npu, &AtomicUsize) + Send + 'static>;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
@@ -93,8 +96,7 @@ impl NpuExecutor {
                     .spawn(move || {
                         // Ends when the executor drops its sender (after draining the queue).
                         for job in receiver {
-                            job(&npu);
-                            counter.fetch_sub(1, Ordering::AcqRel);
+                            job(&npu, &counter);
                         }
                     });
                 match thread {
@@ -138,10 +140,11 @@ impl NpuExecutor {
     {
         let slot = Arc::new(Slot::<T>::default());
         let done = Arc::clone(&slot);
-        let job: Job = Box::new(move |npu: &Npu| {
+        let job: Job = Box::new(move |npu: &Npu, in_flight: &AtomicUsize| {
             let result = catch_unwind(AssertUnwindSafe(|| f(npu))).unwrap_or_else(|_| {
                 Err(Error::Unsupported("job panicked on the NPU worker".into()))
             });
+            in_flight.fetch_sub(1, Ordering::AcqRel);
             done.complete(result);
         });
         let n = self.workers.len();

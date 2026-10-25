@@ -10,6 +10,10 @@
 //! | looseness | many harmonics plus half orders (0.5×, 1.5×, …) |
 //! | outer race | impacts at BPFO ≈ 3.585× ringing a structural resonance |
 //! | inner race | impacts at BPFI ≈ 5.415×, amplitude-modulated at 1× |
+//! | cavitation | random, non-periodic bubble-collapse impacts at 2–5 kHz |
+//!
+//! Cavitation is deliberately **not** one of the classifier's classes: it is
+//! the "fault nobody trained for" that the novelty detector has to catch.
 
 use std::f32::consts::TAU;
 use std::fmt;
@@ -39,6 +43,9 @@ pub enum Condition {
     OuterRace,
     /// Bearing inner-race defect.
     InnerRace,
+    /// Pump cavitation. Not a model class (see [`Condition::ALL`]); used to
+    /// test detection of faults the classifier has never seen.
+    Cavitation,
 }
 
 impl Condition {
@@ -52,9 +59,23 @@ impl Condition {
         Condition::InnerRace,
     ];
 
+    /// Faults the simulator can produce but the classifier never sees.
+    pub const UNSEEN: [Condition; 1] = [Condition::Cavitation];
+
+    /// Position in the model output (`None` for [`Condition::UNSEEN`]).
+    pub fn class(self) -> Option<usize> {
+        Self::ALL.iter().position(|&c| c == self)
+    }
+
     /// Position in the model output.
+    ///
+    /// # Panics
+    /// For conditions in [`Condition::UNSEEN`].
     pub fn index(self) -> usize {
-        Self::ALL.iter().position(|&c| c == self).unwrap_or(0)
+        match self.class() {
+            Some(i) => i,
+            None => panic!("{self} is not a model class"),
+        }
     }
 
     /// Short name, also accepted by `FromStr`.
@@ -66,6 +87,7 @@ impl Condition {
             Condition::Looseness => "looseness",
             Condition::OuterRace => "outer-race",
             Condition::InnerRace => "inner-race",
+            Condition::Cavitation => "cavitation",
         }
     }
 
@@ -78,6 +100,7 @@ impl Condition {
             Condition::Looseness => "check mounting bolts and fits",
             Condition::OuterRace => "plan bearing replacement",
             Condition::InnerRace => "plan bearing replacement (urgent)",
+            Condition::Cavitation => "check suction pressure and flow",
         }
     }
 }
@@ -91,16 +114,14 @@ impl fmt::Display for Condition {
 impl FromStr for Condition {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
-        Self::ALL
-            .into_iter()
-            .find(|c| c.label() == s)
-            .ok_or_else(|| {
-                let names: Vec<_> = Self::ALL.iter().map(|c| c.label()).collect();
-                format!(
-                    "unknown condition `{s}` (expected one of {})",
-                    names.join(", ")
-                )
-            })
+        let all = Self::ALL.into_iter().chain(Self::UNSEEN);
+        all.clone().find(|c| c.label() == s).ok_or_else(|| {
+            let names: Vec<_> = all.map(|c| c.label()).collect();
+            format!(
+                "unknown condition `{s}` (expected one of {})",
+                names.join(", ")
+            )
+        })
     }
 }
 
@@ -250,6 +271,31 @@ impl Machine {
                 // Rolling elements slip a little, so impacts aren't perfectly periodic.
                 t += period * (1.0 + 0.01 * r.gaussian());
             }
+        }
+        if condition == Condition::Cavitation {
+            // Poisson bubble collapses: short, broadband rings at random
+            // frequencies, plus some extra low-frequency turbulence noise.
+            let rate = 3000.0 + 5000.0 * s;
+            let amp = s * r.uniform(0.4, 0.8);
+            let mut t = 0.0f32;
+            let duration = WINDOW as f32 * dt;
+            loop {
+                t += -r.uniform(1e-6, 1.0).ln() / rate;
+                if t >= duration {
+                    break;
+                }
+                let freq = r.uniform(2000.0, 5000.0);
+                let tau = r.uniform(0.15, 0.4) * 1e-3;
+                let a = amp * r.uniform(0.3, 1.0);
+                let start = (t / dt) as usize;
+                let ring = (6.0 * tau / dt) as usize + 1;
+                for k in 0..ring.min(WINDOW - start) {
+                    let tt = k as f32 * dt;
+                    x[start + k] += a * (-tt / tau).exp() * (TAU * freq * tt).sin();
+                }
+            }
+            let turbulence = s * 0.02;
+            x.iter_mut().for_each(|v| *v += turbulence * r.gaussian());
         }
         x
     }

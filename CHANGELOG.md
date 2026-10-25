@@ -23,3 +23,9 @@ official toolkit v2.4.0.
   accuracy check `check_product`, native `cos`/`sin`/`mul` on slices.
 - `signal::FirBank` and `signal::correlate` use block convolution: about 2
   values of NPU traffic per output sample instead of one per tap.
+- `examples/machine-monitor`: PCA novelty detector (SPE + Hotelling T²) built
+  on `qanten::compute` (covariance via `gemm`, resident `NpuMatrix` scoring,
+  daily `check_product` NPU self-check); a cavitation fault the classifier
+  never sees; two new features (band energy, envelope floor).
+- `NpuExecutor`: a job's in-flight count drops before its result is
+  published, so `queue_depths()` is never stale right after `wait()`.

@@ -1,8 +1,10 @@
 use machine_monitor::features::{FeatureExtractor, NUM_FEATURES, feature_names};
-use machine_monitor::fleet::{self, AlarmTracker, Event};
+use machine_monitor::fleet::{self, AlarmTracker, Diagnosis, Event};
 use machine_monitor::model::{self, Dataset, TrainConfig};
 use machine_monitor::sim::BPFO;
-use machine_monitor::{Condition, Diagnoser, INPUT_WIDTH, Machine, WINDOW};
+use machine_monitor::{
+    Assessment, Condition, Diagnoser, INPUT_WIDTH, Machine, OUTPUT_WIDTH, WINDOW,
+};
 use qanten::nn::Module;
 use qanten::{Npu, Tensor};
 
@@ -47,6 +49,28 @@ fn signatures_show_up_in_the_right_features() {
 }
 
 #[test]
+fn cavitation_raises_the_broadband_features() {
+    let npu = Npu::simulator();
+    let fx = FeatureExtractor::new(&npu).unwrap();
+    let m = Machine::random_at(25.0, 3);
+    let healthy = fx
+        .extract(m.shaft_hz, &m.measure(Condition::Healthy, 0.0, 11))
+        .unwrap();
+    let cav = fx
+        .extract(m.shaft_hz, &m.measure(Condition::Cavitation, 0.8, 11))
+        .unwrap();
+    for name in ["log band rms", "log envelope floor"] {
+        let i = feature(name);
+        assert!(
+            cav[i] > healthy[i] + 0.3,
+            "{name}: {} vs {}",
+            cav[i],
+            healthy[i]
+        );
+    }
+}
+
+#[test]
 fn order_features_do_not_depend_on_speed() {
     let npu = Npu::simulator();
     let fx = FeatureExtractor::new(&npu).unwrap();
@@ -73,7 +97,11 @@ fn trains_and_deploys() {
         batch: 32,
         ..Default::default()
     };
-    let sd = model::train(&npu, &data, &config, |_, _, _| {}).unwrap();
+    let mut sd = model::train(&npu, &data, &config, |_, _, _| {}).unwrap();
+    let validation = Dataset::generate(&fx, 10, (0.4, 1.0), 3).unwrap();
+    let fit = model::add_novelty(&npu, &mut sd, &data, &validation).unwrap();
+    assert!(fit.components > 0 && fit.explained >= 0.9);
+    assert!(fit.covariance_error < 1e-2, "{}", fit.covariance_error);
 
     // Round-trip through safetensors like a deployment would.
     let path = std::env::temp_dir().join(format!(
@@ -97,20 +125,63 @@ fn trains_and_deploys() {
     let via_module = diag
         .forward(&Tensor::from_f32(&row, [1, INPUT_WIDTH]).unwrap())
         .unwrap();
-    assert_eq!(via_module.shape(), [1, Condition::ALL.len()]);
-    assert_eq!(via_module.argmax_last(), [Condition::InnerRace.index()]);
+    assert_eq!(via_module.shape(), [1, OUTPUT_WIDTH]);
+    let a = Assessment::from_row(&via_module.to_f32_vec());
+    let best = (0..6)
+        .max_by(|&i, &j| a.probs[i].total_cmp(&a.probs[j]))
+        .unwrap();
+    assert_eq!(best, Condition::InnerRace.index());
+    // The direct path skips the bf16 rounding of the HTTP/Module input; same verdict.
+    let direct = diag.assess(&[(m.shaft_hz, &w)]).unwrap()[0];
+    assert!(direct.probs[best] > 0.5);
+
+    // Novelty: severe cavitation (never trained on) scores far above known conditions.
+    assert!(diag.has_novelty());
+    let known: Vec<f32> = diag.novelty_scores(&test.features).unwrap();
+    let mut sorted = known.clone();
+    sorted.sort_by(f32::total_cmp);
+    let known_median = sorted[sorted.len() / 2];
+    let machines: Vec<Machine> = (0..6).map(|i| Machine::random(100 + i)).collect();
+    let cav: Vec<Vec<f32>> = machines
+        .iter()
+        .zip(0..)
+        .map(|(m, i)| m.measure(Condition::Cavitation, 1.0, i))
+        .collect();
+    let rows: Vec<(f32, &[f32])> = machines
+        .iter()
+        .zip(&cav)
+        .map(|(m, x)| (m.shaft_hz, x.as_slice()))
+        .collect();
+    let cav_scores: Vec<f32> = diag
+        .assess(&rows)
+        .unwrap()
+        .iter()
+        .map(|a| a.novelty)
+        .collect();
+    let flagged = cav_scores.iter().filter(|s| **s > 1.0).count();
+    assert!(
+        flagged >= 4,
+        "cavitation scores {cav_scores:?}, known median {known_median}"
+    );
+    assert!(known_median < 0.8, "{known_median}");
+    let err = diag.self_check(1).unwrap().unwrap();
+    assert!(err < 0.02, "self-check {err}");
     assert!(diag.forward(&Tensor::zeros([1, WINDOW])).is_err());
+}
+
+fn assessment(probs: [f32; 6], novelty: f32) -> Assessment {
+    Assessment { probs, novelty }
 }
 
 #[test]
 fn alarms_need_a_few_confirming_hours() {
     let mut t = AlarmTracker::default();
-    let healthy = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-    let outer = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
-    let inner = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+    let healthy = assessment([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0.1);
+    let outer = assessment([0.0, 0.0, 0.0, 0.0, 1.0, 0.0], 0.2);
+    let inner = assessment([0.0, 0.0, 0.0, 0.0, 0.0, 1.0], 0.2);
     // One bad reading between good ones: no alarm.
-    for p in [healthy, outer, healthy, healthy] {
-        assert_eq!(t.update(&p), Event::None);
+    for p in [&healthy, &outer, &healthy, &healthy] {
+        assert_eq!(t.update(p), Event::None);
     }
     let events: Vec<Event> = (0..8).map(|_| t.update(&outer)).collect();
     let alarms = events
@@ -118,21 +189,67 @@ fn alarms_need_a_few_confirming_hours() {
         .filter(|e| matches!(e, Event::Alarm { .. }))
         .count();
     assert_eq!(alarms, 1);
-    assert_eq!(t.active, Some(Condition::OuterRace));
+    assert_eq!(t.active, Some(Diagnosis::Fault(Condition::OuterRace)));
     let later: Vec<Event> = (0..6).map(|_| t.update(&inner)).collect();
     assert!(later.iter().any(|e| matches!(
         e,
         Event::Reclassified {
-            condition: Condition::InnerRace,
+            diagnosis: Diagnosis::Fault(Condition::InnerRace),
             ..
         }
     )));
 }
 
 #[test]
+fn sustained_novelty_overrides_the_classifier() {
+    let mut t = AlarmTracker::default();
+    // The classifier is sure it's healthy, but the pattern is unlike anything known.
+    let odd = assessment([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], 3.0);
+    let events: Vec<Event> = (0..6).map(|_| t.update(&odd)).collect();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::Alarm {
+            diagnosis: Diagnosis::Unrecognised,
+            ..
+        }
+    )));
+    // A known-fault alarm is upgraded to "unrecognised" once novelty persists.
+    let mut t = AlarmTracker::default();
+    for _ in 0..5 {
+        t.update(&assessment([0.0, 0.0, 0.0, 0.0, 0.0, 1.0], 0.3));
+    }
+    assert_eq!(t.active, Some(Diagnosis::Fault(Condition::InnerRace)));
+    let events: Vec<Event> = (0..8)
+        .map(|_| t.update(&assessment([0.0, 0.0, 0.0, 0.0, 0.0, 1.0], 3.0)))
+        .collect();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::Reclassified {
+            diagnosis: Diagnosis::Unrecognised,
+            ..
+        }
+    )));
+    // A single odd hour does nothing.
+    let mut t = AlarmTracker::default();
+    t.update(&odd);
+    for _ in 0..5 {
+        assert_eq!(
+            t.update(&assessment([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], 0.1)),
+            Event::None
+        );
+    }
+}
+
+#[test]
 fn plant_ground_truth() {
     let assets = fleet::plant(12, 100, 1);
     assert_eq!(assets.len(), 12);
+    assert!(
+        assets
+            .iter()
+            .any(|a| a.degradation.map(|d| d.condition) == Some(Condition::Cavitation)),
+        "the plant includes a fault the classifier never saw"
+    );
     let faulty: Vec<_> = assets
         .iter()
         .filter_map(|a| a.degradation.map(|d| (a, d)))
@@ -151,8 +268,9 @@ fn plant_ground_truth() {
 
 #[test]
 fn condition_names_round_trip() {
-    for c in Condition::ALL {
+    for c in Condition::ALL.into_iter().chain(Condition::UNSEEN) {
         assert_eq!(c.label().parse::<Condition>().unwrap(), c);
     }
+    assert_eq!(Condition::Cavitation.class(), None);
     assert!("broken".parse::<Condition>().is_err());
 }

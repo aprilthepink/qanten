@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use machine_monitor::features::FeatureExtractor;
-use machine_monitor::fleet::{self, AlarmTracker, Event};
+use machine_monitor::fleet::{self, AlarmTracker, Diagnosis, Event};
 use machine_monitor::model::{self, Dataset, TrainConfig};
-use machine_monitor::{Condition, Diagnoser, INPUT_WIDTH, Machine};
+use machine_monitor::{Assessment, Condition, Diagnoser, INPUT_WIDTH, Machine, OUTPUT_WIDTH};
 use qanten::nn::{Module, StateDict};
 use qanten::pool::NpuPool;
 use qanten::profile::Profiler;
@@ -67,7 +67,7 @@ enum Command {
     },
     /// Print an example request body for `serve`.
     Sample {
-        /// One of: healthy, imbalance, misalignment, looseness, outer-race, inner-race.
+        /// One of: healthy, imbalance, misalignment, looseness, outer-race, inner-race, cavitation.
         #[arg(long, default_value = "outer-race")]
         condition: Condition,
         /// Fault severity, 0–1.
@@ -123,23 +123,33 @@ fn train(npu: &Npu, out: &Path, per_class: usize, epochs: usize) -> Result<()> {
     );
 
     let t = Instant::now();
-    let sd = model::train(
-        npu,
-        &data,
-        &TrainConfig {
-            epochs,
-            ..Default::default()
-        },
-        |e, loss, acc| {
-            if e == 1 || e % 10 == 0 || e == epochs {
-                println!(
-                    "  epoch {e:>3}: loss {loss:.3}, train accuracy {:.1}%",
-                    100.0 * acc
-                );
-            }
-        },
-    )?;
+    let config = TrainConfig {
+        epochs,
+        ..Default::default()
+    };
+    let mut sd = model::train(npu, &data, &config, |e, loss, acc| {
+        if e == 1 || e % 10 == 0 || e == epochs {
+            println!(
+                "  epoch {e:>3}: loss {loss:.3}, train accuracy {:.1}%",
+                100.0 * acc
+            );
+        }
+    })?;
     println!("trained in {:.1} s", t.elapsed().as_secs_f64());
+
+    // Novelty detector: PCA model of the training features (qanten::compute).
+    let validation = Dataset::generate(&extractor, per_class / 4 + 1, (0.2, 1.0), 7)?;
+    let fit = model::add_novelty(npu, &mut sd, &data, &validation)?;
+    println!(
+        "novelty detector: {} components explain {:.1}% of the variance; covariance on the {} \
+         (checked error {:.1e}); thresholds SPE {:.1}, T² {:.1}",
+        fit.components,
+        100.0 * fit.explained,
+        if fit.covariance_on_npu { "NPU" } else { "CPU" },
+        fit.covariance_error,
+        fit.thresholds[0],
+        fit.thresholds[1]
+    );
     model::save(&sd, out)?;
     println!("wrote {}", out.display());
 
@@ -159,7 +169,49 @@ fn train(npu: &Npu, out: &Path, per_class: usize, epochs: usize) -> Result<()> {
         );
         print_confusion(&model::confusion(&probs, &test.labels));
     }
+
+    // How well the novelty score separates known conditions from an unseen fault.
+    let known = Dataset::generate(&extractor, per_class / 4 + 1, (0.2, 1.0), 99)?;
+    let known_flagged = flagged(&diag.novelty_scores(&known.features)?);
+    let mut rng = machine_monitor::sim::Rng::new(5);
+    let unseen: Vec<(f32, Vec<f32>)> = (0..per_class / 4 + 1)
+        .map(|_| {
+            let m = Machine::random(rng.next_u64());
+            let sev = rng.uniform(0.3, 1.0);
+            (
+                m.shaft_hz,
+                m.measure(Condition::Cavitation, sev, rng.next_u64()),
+            )
+        })
+        .collect();
+    let rows: Vec<(f32, &[f32])> = unseen.iter().map(|(f, x)| (*f, x.as_slice())).collect();
+    let assessed = diag.assess(&rows)?;
+    let novelty: Vec<f32> = assessed.iter().map(|a| a.novelty).collect();
+    let mut called = [0usize; 6];
+    for a in &assessed {
+        let best = (0..6)
+            .max_by(|&i, &j| a.probs[i].total_cmp(&a.probs[j]))
+            .unwrap_or(0);
+        called[best] += 1;
+    }
+    let calls: Vec<String> = Condition::ALL
+        .iter()
+        .zip(called)
+        .filter(|(_, n)| *n > 0)
+        .map(|(c, n)| format!("{c} {n}"))
+        .collect();
+    println!(
+        "\nnovelty (score > 1): {:.1}% of known-condition windows, {:.1}% of cavitation windows \
+         (a fault the classifier never saw; it called them: {})",
+        100.0 * known_flagged,
+        100.0 * flagged(&novelty),
+        calls.join(", ")
+    );
     Ok(())
+}
+
+fn flagged(scores: &[f32]) -> f32 {
+    scores.iter().filter(|s| **s > 1.0).count() as f32 / scores.len().max(1) as f32
 }
 
 fn clock(hour: usize) -> String {
@@ -174,17 +226,37 @@ fn monitor(pool: &NpuPool, path: &Path, machines: usize, hours: usize, seed: u64
     let pool = NpuPool::new(npus)?;
     // One copy of the pipeline per NPU; each hour's batch is split across them.
     let diagnoser = pool.replicate(|npu| Diagnoser::load(npu, &sd))?;
+    if !diagnoser.copies()[0].has_novelty() {
+        println!("note: model has no novelty detector (retrain to get one)");
+    }
     let assets = fleet::plant(machines, hours, seed);
     let mut trackers = vec![AlarmTracker::default(); machines];
-    let mut first_alarm: Vec<Option<(usize, Condition)>> = vec![None; machines];
-    let mut final_call: Vec<Option<Condition>> = vec![None; machines];
+    let mut first_alarm: Vec<Option<(usize, Diagnosis)>> = vec![None; machines];
+    let mut final_call: Vec<Option<Diagnosis>> = vec![None; machines];
     let mut npu_time = Duration::ZERO;
+    let mut worst_check = 0.0f64;
 
     println!(
         "monitoring {machines} machines for {hours} hours ({} days)\n",
         hours / 24
     );
     for hour in 0..hours {
+        // Daily NPU self-test: random vectors through each NPU's resident
+        // novelty projector, verified on the CPU with compute::check_product.
+        if hour % 24 == 0 {
+            for (n, copy) in diagnoser.copies().iter().enumerate() {
+                if let Some(err) = copy.self_check(hour as u64)? {
+                    worst_check = worst_check.max(err);
+                    if err > 0.05 {
+                        println!(
+                            "{}  NPU {n} self-check error {:.1}%: recalibrate",
+                            clock(hour),
+                            100.0 * err
+                        );
+                    }
+                }
+            }
+        }
         let mut batch = Vec::with_capacity(machines * INPUT_WIDTH);
         for a in &assets {
             batch.push(a.machine.shaft_hz);
@@ -192,46 +264,42 @@ fn monitor(pool: &NpuPool, path: &Path, machines: usize, hours: usize, seed: u64
         }
         let x = Tensor::from_f32(&batch, [machines, INPUT_WIDTH])?;
         let t = Instant::now();
-        let probs = diagnoser.forward(&x)?.to_f32_vec();
+        let out = diagnoser.forward(&x)?.to_f32_vec();
         npu_time += t.elapsed();
-        for (i, row) in probs.chunks(Condition::ALL.len()).enumerate() {
-            let event = trackers[i].update(row);
+        for (i, row) in out.chunks(OUTPUT_WIDTH).enumerate() {
+            let event = trackers[i].update(&Assessment::from_row(row));
             let a = &assets[i];
-            match event {
+            let (kind, diagnosis, confidence) = match event {
                 Event::Alarm {
-                    condition,
+                    diagnosis,
                     confidence,
                 } => {
-                    println!(
-                        "{}  ALARM   {:<14} {condition:<13} {:>3.0}%  -> {}",
-                        clock(hour),
-                        a.name,
-                        100.0 * confidence,
-                        condition.action()
-                    );
-                    first_alarm[i] = Some((hour, condition));
-                    final_call[i] = Some(condition);
+                    first_alarm[i] = Some((hour, diagnosis));
+                    ("ALARM ", diagnosis, confidence)
                 }
                 Event::Reclassified {
-                    condition,
+                    diagnosis,
                     confidence,
-                } => {
-                    println!(
-                        "{}  UPDATE  {:<14} now {condition:<9} {:>3.0}%  -> {}",
-                        clock(hour),
-                        a.name,
-                        100.0 * confidence,
-                        condition.action()
-                    );
-                    final_call[i] = Some(condition);
-                }
-                Event::None => {}
-            }
+                } => ("UPDATE", diagnosis, confidence),
+                Event::None => continue,
+            };
+            final_call[i] = Some(diagnosis);
+            let strength = match diagnosis {
+                Diagnosis::Unrecognised => format!("novelty {confidence:.1}"),
+                Diagnosis::Fault(_) => format!("{:.0}%", 100.0 * confidence),
+            };
+            println!(
+                "{}  {kind}  {:<14} {:<13} {strength:<12} -> {}",
+                clock(hour),
+                a.name,
+                diagnosis.to_string(),
+                diagnosis.action()
+            );
         }
     }
 
     println!(
-        "\n{:<14} {:<32} {:<30} {:>9} {:>7}  result",
+        "\n{:<14} {:<32} {:<32} {:>9} {:>7}  result",
         "machine", "truth", "first alarm", "severity", "health"
     );
     let (mut hits, mut wrong, mut missed, mut false_alarms, mut faults) = (0, 0, 0, 0, 0);
@@ -241,26 +309,27 @@ fn monitor(pool: &NpuPool, path: &Path, machines: usize, hours: usize, seed: u64
             None => "healthy".into(),
         };
         let alarm = first_alarm[i]
-            .map(|(h, c)| format!("{c} at {}", clock(h)))
+            .map(|(h, d)| format!("{d} at {}", clock(h)))
             .unwrap_or_else(|| "-".into());
-        let (lead, result) = match (a.degradation, first_alarm[i]) {
+        let (severity, result) = match (a.degradation, first_alarm[i]) {
             (Some(d), Some((h, _))) => {
                 faults += 1;
-                let severity = a.state_at(h).1;
-                let ok = final_call[i] == Some(d.condition);
+                let expected = match d.condition.class() {
+                    Some(_) => Diagnosis::Fault(d.condition),
+                    None => Diagnosis::Unrecognised,
+                };
+                let ok = final_call[i] == Some(expected);
                 if ok {
                     hits += 1
                 } else {
                     wrong += 1
                 }
-                (
-                    format!("{:.0}%", 100.0 * severity),
-                    if ok {
-                        "detected"
-                    } else {
-                        "detected, wrong fault"
-                    },
-                )
+                let result = match (ok, expected) {
+                    (true, Diagnosis::Unrecognised) => "detected (new fault type)",
+                    (true, _) => "detected",
+                    (false, _) => "detected, wrong diagnosis",
+                };
+                (format!("{:.0}%", 100.0 * a.state_at(h).1), result)
             }
             (Some(_), None) => {
                 faults += 1;
@@ -284,7 +353,7 @@ fn monitor(pool: &NpuPool, path: &Path, machines: usize, hours: usize, seed: u64
             (None, None) => ("-".into(), "ok"),
         };
         println!(
-            "{:<14} {truth:<32} {alarm:<30} {lead:>9} {:>6.0}%  {result}",
+            "{:<14} {truth:<32} {alarm:<32} {severity:>9} {:>6.0}%  {result}",
             a.name,
             100.0 * trackers[i].health()
         );
@@ -304,6 +373,12 @@ fn monitor(pool: &NpuPool, path: &Path, machines: usize, hours: usize, seed: u64
         windows as f64 / npu_time.as_secs_f64(),
         npu_time.as_secs_f64() * 1e3 / hours as f64
     );
+    if diagnoser.copies()[0].has_novelty() {
+        println!(
+            "daily NPU self-checks: worst relative error {:.2}%",
+            100.0 * worst_check
+        );
+    }
     for (i, p) in profilers.iter().enumerate() {
         let t = p.report().total();
         println!(
@@ -321,10 +396,15 @@ async fn serve(pool: NpuPool, path: PathBuf, addr: String) -> Result<()> {
         .with_context(|| format!("{} (run `machine-monitor train` first)", path.display()))?;
     let mut state = qanten_serve::AppState::new(&pool, qanten_serve::ServerConfig::default())?;
     state.add_module("diagnose", INPUT_WIDTH, |npu| Diagnoser::load(npu, &sd))?;
-    let classes: Vec<_> = Condition::ALL
+    let mut classes: Vec<_> = Condition::ALL
         .iter()
         .map(|c| serde_json::json!({ "index": c.index(), "condition": c.label(), "action": c.action() }))
         .collect();
+    classes.push(serde_json::json!({
+        "index": 6,
+        "novelty": "max(SPE, T²) over their thresholds; above 1 = unlike every known condition",
+        "action": Diagnosis::Unrecognised.action(),
+    }));
     let app = qanten_serve::router(Arc::new(state)).route(
         "/v1/conditions",
         axum::routing::get(move || async move { axum::Json(classes.clone()) }),

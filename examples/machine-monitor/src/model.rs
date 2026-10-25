@@ -8,6 +8,7 @@ use qanten::train::{self, Adam, Dense, Model, Relu};
 use qanten::{Error, Npu, Result, Tensor};
 
 use crate::features::{FeatureExtractor, NUM_FEATURES};
+use crate::novelty::{self, FitReport, NoveltyDetector};
 use crate::sim::{Condition, Machine, Rng, WINDOW};
 
 const HIDDEN: [usize; 2] = [64, 32];
@@ -184,6 +185,30 @@ pub fn train(
     Ok(sd)
 }
 
+impl Normalizer {
+    fn from_state_dict(sd: &StateDict) -> Result<Self> {
+        Ok(Self {
+            mean: sd.get("norm.mean")?.to_f32_vec(),
+            std: sd.get("norm.std")?.to_f32_vec(),
+        })
+    }
+}
+
+/// Fits the novelty detector (see [`novelty`]) on the training features and
+/// calibrates it on `validation`, adding it to the weights from [`train()`].
+pub fn add_novelty(
+    npu: &Npu,
+    sd: &mut StateDict,
+    train: &Dataset,
+    validation: &Dataset,
+) -> Result<FitReport> {
+    let norm = Normalizer::from_state_dict(sd)?;
+    let (mut t, mut v) = (train.features.clone(), validation.features.clone());
+    norm.apply(&mut t);
+    norm.apply(&mut v);
+    novelty::fit(npu, &t, &v, sd)
+}
+
 /// Saves trained weights as `.safetensors`.
 pub fn save(sd: &StateDict, path: &Path) -> anyhow::Result<()> {
     std::fs::write(path, sd.to_safetensors_bytes()?)?;
@@ -196,18 +221,41 @@ pub struct Diagnoser {
     extractor: FeatureExtractor,
     norm: Normalizer,
     net: nn::Sequential,
+    novelty: Option<NoveltyDetector>,
 }
 
 /// Width of one [`Diagnoser`] input row: the shaft speed in Hz followed by the window.
 pub const INPUT_WIDTH: usize = 1 + WINDOW;
+/// Width of one [`Diagnoser`] output row: six condition probabilities, then
+/// the novelty score (above 1 = unlike any known condition; 0 if the model
+/// has no novelty detector).
+pub const OUTPUT_WIDTH: usize = 7;
+
+/// Classifier output plus novelty score for one window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Assessment {
+    /// Probabilities in [`Condition::ALL`] order.
+    pub probs: [f32; 6],
+    /// Novelty score (max of SPE and T² over their thresholds); above 1 = unusual.
+    pub novelty: f32,
+}
+
+impl Assessment {
+    /// From one [`OUTPUT_WIDTH`] row.
+    pub fn from_row(row: &[f32]) -> Self {
+        let mut probs = [0.0; 6];
+        probs.copy_from_slice(&row[..6]);
+        Self {
+            probs,
+            novelty: row[6],
+        }
+    }
+}
 
 impl Diagnoser {
     /// Builds the pipeline on `npu` from trained weights.
     pub fn load(npu: &Npu, sd: &StateDict) -> Result<Self> {
-        let norm = Normalizer {
-            mean: sd.get("norm.mean")?.to_f32_vec(),
-            std: sd.get("norm.std")?.to_f32_vec(),
-        };
+        let norm = Normalizer::from_state_dict(sd)?;
         let net = nn::Sequential::new()
             .add(nn::Linear::load(npu, sd, "0")?)
             .add(nn::ReLU)
@@ -219,6 +267,7 @@ impl Diagnoser {
             extractor: FeatureExtractor::new(npu)?,
             norm,
             net,
+            novelty: NoveltyDetector::load(npu, sd)?,
         })
     }
 
@@ -242,15 +291,53 @@ impl Diagnoser {
             .forward(&Tensor::from_f32(&f, [rows, NUM_FEATURES])?)
     }
 
-    /// Condition probabilities `[rows, 6]` for raw windows `(shaft_hz, samples)`.
-    pub fn diagnose(&self, windows: &[(f32, &[f32])]) -> Result<Tensor> {
-        self.classify_features(&self.extractor.extract_batch(windows)?)
+    /// Novelty scores from already extracted features (zeros without a detector).
+    pub fn novelty_scores(&self, features: &[f32]) -> Result<Vec<f32>> {
+        let rows = features.len() / NUM_FEATURES;
+        match &self.novelty {
+            Some(d) => {
+                let mut f = features.to_vec();
+                self.norm.apply(&mut f);
+                d.score(&f)
+            }
+            None => Ok(vec![0.0; rows]),
+        }
+    }
+
+    /// `true` if the model includes a novelty detector.
+    pub fn has_novelty(&self) -> bool {
+        self.novelty.is_some()
+    }
+
+    /// NPU self-test through the resident novelty projector (relative error,
+    /// see [`NoveltyDetector::self_check`]); `None` without a detector.
+    pub fn self_check(&self, seed: u64) -> Result<Option<f64>> {
+        self.novelty
+            .as_ref()
+            .map(|d| d.self_check(32, seed))
+            .transpose()
+    }
+
+    /// Full assessment of raw windows `(shaft_hz, samples)`.
+    pub fn assess(&self, windows: &[(f32, &[f32])]) -> Result<Vec<Assessment>> {
+        let features = self.extractor.extract_batch(windows)?;
+        let probs = self.classify_features(&features)?.to_f32_vec();
+        let novelty = self.novelty_scores(&features)?;
+        Ok(probs
+            .chunks(6)
+            .zip(novelty)
+            .map(|(p, n)| {
+                let mut row = p.to_vec();
+                row.push(n);
+                Assessment::from_row(&row)
+            })
+            .collect())
     }
 }
 
 /// Input `[rows, 1 + WINDOW]` (shaft speed in Hz, then the samples), output
-/// probabilities `[rows, 6]` in [`Condition::ALL`] order. This is what the
-/// HTTP server and the multi-NPU pool run.
+/// `[rows, 7]`: probabilities in [`Condition::ALL`] order, then the novelty
+/// score. This is what the HTTP server and the multi-NPU pool run.
 impl Module for Diagnoser {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let [_, width] = x.dims::<2>()?;
@@ -262,7 +349,12 @@ impl Module for Diagnoser {
         }
         let v = x.to_f32_vec();
         let rows: Vec<(f32, &[f32])> = v.chunks(INPUT_WIDTH).map(|r| (r[0], &r[1..])).collect();
-        self.diagnose(&rows)
+        let out: Vec<f32> = self
+            .assess(&rows)?
+            .iter()
+            .flat_map(|a| a.probs.into_iter().chain([a.novelty]))
+            .collect();
+        Tensor::from_f32(&out, [rows.len(), OUTPUT_WIDTH])
     }
 
     fn name(&self) -> &'static str {
