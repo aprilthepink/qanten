@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use qanten::Npu;
+use qanten::compute::Matrix;
 use qanten_graphics::blendshapes::Blendshapes;
 use qanten_graphics::dct::Dct8x8;
 use qanten_graphics::glam::{Mat4, Quat, Vec2, Vec3};
@@ -53,14 +54,12 @@ fn ocean(c: &mut Criterion) {
     g.finish();
 }
 
-fn mesh_rest(mesh: &SkinnedMesh) -> Vec<Vec3> {
-    (0..mesh.vertex_count())
+/// A strip of `verts` vertices, each blending two neighbouring bones.
+fn strip_mesh(verts: usize, bones: usize) -> SkinnedMesh {
+    let rest = (0..verts)
         .map(|i| Vec3::new((i % 20) as f32 * 0.01, i as f32 * 0.002, 0.0))
-        .collect()
-}
-
-fn mesh_infl(verts: usize, bones: usize) -> Vec<[(u16, f32); 4]> {
-    (0..verts)
+        .collect();
+    let infl = (0..verts)
         .map(|i| {
             let b = (i * bones / verts) as u16;
             [
@@ -70,38 +69,38 @@ fn mesh_infl(verts: usize, bones: usize) -> Vec<[(u16, f32); 4]> {
                 (0, 0.0),
             ]
         })
-        .collect()
+        .collect();
+    SkinnedMesh::new(rest, None, infl, bones).unwrap()
 }
 
 fn skinning(c: &mut Criterion) {
     let npu = npu();
     let (verts, bones, chars) = (1280usize, 12usize, 60usize);
-    let rest: Vec<Vec3> = (0..verts)
-        .map(|i| Vec3::new((i % 20) as f32 * 0.01, i as f32 * 0.002, 0.0))
-        .collect();
-    let mesh = SkinnedMesh::new(rest, None, mesh_infl(verts, bones), bones).unwrap();
-    let poses: Vec<Mat4> = (0..chars * bones)
-        .map(|k| {
-            Mat4::from_rotation_translation(
-                Quat::from_rotation_z(k as f32 * 0.01),
-                Vec3::splat(0.1),
-            )
+    let poses: Vec<Vec<Mat4>> = (0..chars)
+        .map(|c| {
+            (0..bones)
+                .map(|b| {
+                    let k = (c * bones + b) as f32;
+                    Mat4::from_rotation_translation(
+                        Quat::from_rotation_z(k * 0.01),
+                        Vec3::splat(0.1),
+                    )
+                })
+                .collect()
         })
         .collect();
     let mut g = group(c, "skinning_60x1280v_12b");
+    let cpu = strip_mesh(verts, bones);
     g.bench_function("cpu_lbs", |b| {
-        b.iter(|| mesh.skin_batch_cpu(black_box(&poses)))
+        b.iter(|| cpu.skin_batch_cpu(black_box(&poses)))
     });
-    let pool = qanten::pool::NpuPool::simulated(3).unwrap();
-    let pooled = SkinnedMesh::new(mesh_rest(&mesh), None, mesh_infl(verts, bones), bones)
-        .unwrap()
-        .with_pool(&pool)
-        .unwrap();
-    let mesh = mesh.with_npu(&npu).unwrap();
+    let mesh = strip_mesh(verts, bones).with_npu(&npu).unwrap();
     g.bench_function("npu_matmul", |b| {
         b.iter(|| mesh.skin_batch(black_box(&poses)).unwrap())
     });
     // A copy of the skinning matrix on each of 3 NPUs; characters split between them.
+    let pool = qanten::pool::NpuPool::simulated(3).unwrap();
+    let pooled = strip_mesh(verts, bones).with_pool(&pool).unwrap();
     g.bench_function("npu_pool3", |b| {
         b.iter(|| pooled.skin_batch(black_box(&poses)).unwrap())
     });
@@ -122,11 +121,13 @@ fn blendshapes(c: &mut Criterion) {
         })
         .collect();
     let bs = Blendshapes::new(base, &deltas).unwrap();
-    let w: Vec<f32> = (0..chars * shapes)
-        .map(|k| (k as f32 * 0.1).sin().abs())
-        .collect();
+    let w = Matrix::from_fn(chars, shapes, |c, s| {
+        ((c * shapes + s) as f32 * 0.1).sin().abs()
+    });
     let mut g = group(c, "blendshapes_50x4000v_52s");
-    g.bench_function("cpu", |b| b.iter(|| bs.evaluate_batch_cpu(black_box(&w))));
+    g.bench_function("cpu", |b| {
+        b.iter(|| bs.evaluate_batch_cpu(black_box(&w)).unwrap())
+    });
     let bs = bs.with_npu(&npu).unwrap();
     g.bench_function("npu_matmul", |b| {
         b.iter(|| bs.evaluate_batch(black_box(&w)).unwrap())
@@ -137,17 +138,17 @@ fn blendshapes(c: &mut Criterion) {
 fn probes(c: &mut Criterion) {
     let npu = npu();
     let proj = ShProjector::fibonacci(1024);
-    let radiance: Vec<Vec3> = (0..256)
-        .flat_map(|p| {
+    let radiance: Vec<Vec<Vec3>> = (0..256)
+        .map(|p| {
             proj.directions()
                 .iter()
-                .map(move |d| Vec3::splat(1.0 + d.y * (p as f32 / 256.0 * TAU).sin()))
-                .collect::<Vec<_>>()
+                .map(|d| Vec3::splat(1.0 + d.y * (p as f32 / 256.0 * TAU).sin()))
+                .collect()
         })
         .collect();
     let mut g = group(c, "sh_bake_256probes_1024samples");
     g.bench_function("cpu", |b| {
-        b.iter(|| proj.project_batch_cpu(black_box(&radiance)))
+        b.iter(|| proj.project_batch_cpu(black_box(&radiance)).unwrap())
     });
     let proj = proj.with_npu(&npu).unwrap();
     g.bench_function("npu_matmul", |b| {
@@ -158,15 +159,15 @@ fn probes(c: &mut Criterion) {
 
 fn dct(c: &mut Criterion) {
     let npu = npu();
-    let plane: Vec<f32> = (0..512 * 512).map(|k| (k % 255) as f32).collect();
+    let plane = Matrix::from_fn(512, 512, |y, x| ((y * 512 + x) % 255) as f32);
     let mut g = group(c, "dct_512x512");
     let cpu = Dct8x8::new();
     g.bench_function("cpu", |b| {
-        b.iter(|| cpu.forward(black_box(&plane), 512, 512).unwrap())
+        b.iter(|| cpu.forward(black_box(&plane)).unwrap())
     });
     let acc = Dct8x8::new().with_npu(&npu).unwrap();
     g.bench_function("npu_matmul", |b| {
-        b.iter(|| acc.forward(black_box(&plane), 512, 512).unwrap())
+        b.iter(|| acc.forward(black_box(&plane)).unwrap())
     });
     g.finish();
 }

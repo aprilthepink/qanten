@@ -8,9 +8,10 @@ mod common;
 
 use std::f32::consts::{PI, TAU};
 
-use common::{Canvas, max_err, view_proj};
+use common::{Canvas, max_err_all, view_proj};
 use glam::Vec3;
 use qanten::Npu;
+use qanten::compute::Matrix;
 use qanten_graphics::blendshapes::Blendshapes;
 
 const LAT: usize = 48;
@@ -59,21 +60,20 @@ fn main() -> anyhow::Result<()> {
         Blendshapes::new(base.clone(), &[squash, bulge, spikes, ripple])?.with_npu(&npu)?;
 
     // Six characters' weights, evaluated together.
-    let weights: Vec<f32> = [
+    let weights = Matrix::from_rows(&[
         [0.0, 0.0, 0.0, 0.0],
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 1.0, 0.0, 0.0],
         [0.0, 0.0, 1.0, 0.0],
         [0.0, 0.0, 0.0, 1.0],
         [0.4, 0.6, 0.7, 0.5],
-    ]
-    .concat();
+    ])?;
     let all = shapes.evaluate_batch(&weights)?;
-    let reference = shapes.evaluate_batch_cpu(&weights);
+    let reference = shapes.evaluate_batch_cpu(&weights)?;
     println!(
         "6 characters × {} vertices × 4 shapes in one call, max error {:.5}",
         base.len(),
-        max_err(&all, &reference)
+        max_err_all(&all, &reference)
     );
 
     let (w, h) = (1500, 300);
@@ -89,9 +89,7 @@ fn main() -> anyhow::Result<()> {
         Vec3::new(0.03, 0.035, 0.05).lerp(Vec3::new(0.10, 0.08, 0.12), v)
     });
     let light = Vec3::new(-0.5, 0.8, 0.6).normalize();
-    let v = base.len();
-    for c in 0..6 {
-        let pos = &all[c * v..(c + 1) * v];
+    for (c, pos) in all.iter().enumerate() {
         let offset = Vec3::new((c as f32 - 2.5) * 2.85, 0.0, 0.0);
         let albedo = [
             Vec3::new(0.8, 0.8, 0.85),

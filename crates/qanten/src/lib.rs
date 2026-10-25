@@ -56,7 +56,7 @@ pub mod onnx;
 pub mod ops;
 pub mod pool;
 pub mod profile;
-mod rng;
+pub mod rng;
 pub mod signal;
 mod tensor;
 pub mod train;

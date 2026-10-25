@@ -2,10 +2,12 @@
 
 use glam::{Mat4, Quat, Vec2, Vec3};
 use qanten::Npu;
+use qanten::compute::Matrix;
+use qanten::pool::NpuPool;
 use qanten_graphics::blendshapes::Blendshapes;
 use qanten_graphics::dct::Dct8x8;
 use qanten_graphics::ocean::{GerstnerOcean, Grid, wind_sea};
-use qanten_graphics::sh::{self, ShProjector};
+use qanten_graphics::sh::{IrradianceBaker, ShProjector};
 use qanten_graphics::skinning::SkinnedMesh;
 
 fn max_err(a: &[Vec3], b: &[Vec3]) -> f32 {
@@ -13,6 +15,41 @@ fn max_err(a: &[Vec3], b: &[Vec3]) -> f32 {
         .zip(b)
         .map(|(x, y)| (*x - *y).abs().max_element())
         .fold(0.0, f32::max)
+}
+
+/// Largest error over per-character results.
+fn max_err_all(a: &[Vec<Vec3>], b: &[Vec<Vec3>]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| max_err(x, y))
+        .fold(0.0, f32::max)
+}
+
+/// A column of `n` vertices along y, blending from bone 0 to bone 1.
+fn two_bone_column(n: usize, normals: bool) -> SkinnedMesh {
+    let rest: Vec<Vec3> = (0..n)
+        .map(|i| Vec3::new(0.1, i as f32 * 0.01, 0.05))
+        .collect();
+    let infl = (0..n)
+        .map(|i| {
+            let t = i as f32 / (n - 1) as f32;
+            [(0, 1.0 - t), (1, t), (0, 0.0), (0, 0.0)]
+        })
+        .collect();
+    let normals = normals.then(|| vec![Vec3::X; n]);
+    SkinnedMesh::new(rest, normals, infl, 2).unwrap()
+}
+
+fn two_bone_poses(characters: usize) -> Vec<[Mat4; 2]> {
+    (0..characters)
+        .map(|c| {
+            let a = c as f32 * 0.2;
+            [
+                Mat4::from_translation(Vec3::new(a, 0.0, 0.0)),
+                Mat4::from_rotation_translation(Quat::from_rotation_z(a), Vec3::new(0.0, 0.0, a)),
+            ]
+        })
+        .collect()
 }
 
 #[test]
@@ -75,52 +112,33 @@ fn blendshapes_npu_matches_cpu() {
         })
         .collect();
     let bs = Blendshapes::new(base, &deltas).unwrap();
-    let weights: Vec<f32> = (0..5 * 12).map(|k| (k % 9) as f32 / 9.0).collect();
-    let want = bs.evaluate_batch_cpu(&weights);
-    let got = bs
-        .with_npu(&Npu::simulator())
-        .unwrap()
-        .evaluate_batch(&weights)
-        .unwrap();
-    assert_eq!(got.len(), 5 * v);
-    assert!(max_err(&got, &want) < 0.01, "{}", max_err(&got, &want));
+    let weights = Matrix::from_fn(5, 12, |c, s| ((c * 12 + s) % 9) as f32 / 9.0);
+    let want = bs.evaluate_batch_cpu(&weights).unwrap();
+    let bs = bs.with_npu(&Npu::simulator()).unwrap();
+    let got = bs.evaluate_batch(&weights).unwrap();
+    assert_eq!((got.len(), got[0].len()), (5, v));
+    assert!(
+        max_err_all(&got, &want) < 0.01,
+        "{}",
+        max_err_all(&got, &want)
+    );
+    assert_eq!(bs.evaluate(weights.row(2)).unwrap(), got[2]);
+    assert!(bs.evaluate(&[1.0; 3]).is_err());
 }
 
 #[test]
 fn skinning_npu_matches_cpu() {
-    // A column of vertices along y, two bones blending in the middle.
-    let rest: Vec<Vec3> = (0..200)
-        .map(|i| Vec3::new(0.1, i as f32 * 0.01, 0.05))
-        .collect();
-    let normals: Vec<Vec3> = rest.iter().map(|_| Vec3::X).collect();
-    let infl = (0..200)
-        .map(|i| {
-            let t = i as f32 / 199.0;
-            [(0, 1.0 - t), (1, t), (0, 0.0), (0, 0.0)]
-        })
-        .collect();
-    let mesh = SkinnedMesh::new(rest, Some(normals), infl, 2).unwrap();
-    let poses: Vec<Mat4> = (0..8)
-        .flat_map(|c| {
-            let a = c as f32 * 0.2;
-            [
-                Mat4::from_translation(Vec3::new(a, 0.0, 0.0)),
-                Mat4::from_rotation_translation(Quat::from_rotation_z(a), Vec3::new(0.0, 0.0, a)),
-            ]
-        })
-        .collect();
+    let mesh = two_bone_column(200, true);
+    let poses = two_bone_poses(8);
     let want = mesh.skin_batch_cpu(&poses);
-    let got = mesh
-        .with_npu(&Npu::simulator())
-        .unwrap()
-        .skin_batch(&poses)
-        .unwrap();
-    assert!(
-        max_err(&got.positions, &want.positions) < 0.02,
-        "{}",
-        max_err(&got.positions, &want.positions)
-    );
-    assert!(max_err(&got.normals, &want.normals) < 0.02);
+    let mesh = mesh.with_npu(&Npu::simulator()).unwrap();
+    let got = mesh.skin_batch(&poses).unwrap();
+    for (g, w) in got.iter().zip(&want) {
+        assert!(max_err(&g.positions, &w.positions) < 0.02);
+        assert!(max_err(&g.normals, &w.normals) < 0.02);
+    }
+    assert_eq!(mesh.skin(&poses[3]).unwrap(), got[3]);
+    assert!(mesh.skin(&[Mat4::IDENTITY]).is_err(), "wrong bone count");
     assert!(SkinnedMesh::new(vec![Vec3::ZERO], None, vec![[(5, 1.0); 4]], 2).is_err());
 }
 
@@ -134,45 +152,58 @@ fn sh_projection_and_irradiance() {
     assert!((sky.irradiance(Vec3::Y).x - std::f32::consts::PI).abs() < 0.05);
     // A directional-ish environment: NPU vs CPU projection.
     let env = |d: Vec3| Vec3::new(1.0 + d.y, 0.5 + 0.5 * d.x, d.z.max(0.0) * 3.0);
-    let samples: Vec<Vec3> = (0..4)
-        .flat_map(|p| {
+    let probes: Vec<Vec<Vec3>> = (1..=4)
+        .map(|p| {
             proj.directions()
                 .iter()
-                .map(move |&d| env(d) * (p + 1) as f32)
+                .map(|&d| env(d) * p as f32)
+                .collect()
         })
         .collect();
-    let got = proj.project_batch(&samples).unwrap();
-    let want = proj.project_batch_cpu(&samples);
+    let got = proj.project_batch(&probes).unwrap();
+    let want = proj.project_batch_cpu(&probes).unwrap();
     for (g, w) in got.iter().zip(&want) {
         assert!(max_err(&g.coeffs, &w.coeffs) < 0.05 * 4.0);
     }
+    // Baking irradiance at a few normals: NPU vs exact per-normal evaluation.
     let normals = [Vec3::Y, Vec3::X, -Vec3::Y, Vec3::new(0.0, 0.6, 0.8)];
-    let a = sh::irradiance_batch(Some(&Npu::simulator()), &want, &normals).unwrap();
-    let b = sh::irradiance_batch(None, &want, &normals).unwrap();
-    assert!(max_err(&a, &b) < 0.1, "{}", max_err(&a, &b));
+    let baker = IrradianceBaker::new(&normals)
+        .with_npu(&Npu::simulator())
+        .unwrap();
+    let baked = baker.bake(&want).unwrap();
+    let exact: Vec<Vec<Vec3>> = want
+        .iter()
+        .map(|p| normals.iter().map(|&n| p.irradiance(n)).collect())
+        .collect();
+    assert!(
+        max_err_all(&baked, &exact) < 0.1,
+        "{}",
+        max_err_all(&baked, &exact)
+    );
+    assert!(max_err_all(&baker.bake_cpu(&want).unwrap(), &exact) < 1e-5);
 }
 
 #[test]
 fn dct_roundtrip() {
-    let (w, h) = (32, 16);
-    let img: Vec<f32> = (0..w * h)
-        .map(|k| ((k * 37) % 255) as f32 / 255.0)
-        .collect();
+    let img = Matrix::from_fn(16, 32, |r, c| ((r * 32 + c) * 37 % 255) as f32 / 255.0);
     let cpu = Dct8x8::new();
     let npu = Dct8x8::new().with_npu(&Npu::simulator()).unwrap();
-    let c_cpu = cpu.forward(&img, w, h).unwrap();
-    let c_npu = npu.forward(&img, w, h).unwrap();
-    let back = cpu.inverse(&c_cpu, w, h).unwrap();
-    assert!(img.iter().zip(&back).all(|(a, b)| (a - b).abs() < 1e-4));
-    assert!(c_cpu.iter().zip(&c_npu).all(|(a, b)| (a - b).abs() < 0.05));
-    let back_npu = npu.inverse(&c_npu, w, h).unwrap();
-    assert!(img.iter().zip(&back_npu).all(|(a, b)| (a - b).abs() < 0.02));
-    assert!(cpu.forward(&img, 30, 16).is_err());
+    let c_cpu = cpu.forward(&img).unwrap();
+    let c_npu = npu.forward(&img).unwrap();
+    let close = |a: &Matrix, b: &Matrix, tol: f32| {
+        a.as_slice()
+            .iter()
+            .zip(b.as_slice())
+            .all(|(x, y)| (x - y).abs() < tol)
+    };
+    assert!(close(&cpu.inverse(&c_cpu).unwrap(), &img, 1e-4));
+    assert!(close(&c_cpu, &c_npu, 0.05));
+    assert!(close(&npu.inverse(&c_npu).unwrap(), &img, 0.02));
+    assert!(cpu.forward(&Matrix::zeros(16, 30)).is_err());
 }
 
 #[test]
 fn pools_match_one_npu_and_self_checks_pass() {
-    use qanten::pool::NpuPool;
     let pool = NpuPool::simulated(3).unwrap();
     let one = Npu::simulator();
 
@@ -191,37 +222,21 @@ fn pools_match_one_npu_and_self_checks_pass() {
         a.evaluate(3.0).unwrap().positions,
         b.evaluate(3.0).unwrap().positions
     );
-    let cpu = GerstnerOcean::new(waves, grid).unwrap();
-    assert_eq!(cpu.self_check().unwrap(), None);
-
-    // Skinning: many characters split across the pool.
-    let rest: Vec<Vec3> = (0..100)
-        .map(|i| Vec3::new(0.0, i as f32 * 0.02, 0.0))
-        .collect();
-    let infl: Vec<_> = (0..100)
-        .map(|i| {
-            [
-                (0, 1.0 - i as f32 / 99.0),
-                (1, i as f32 / 99.0),
-                (0, 0.0),
-                (0, 0.0),
-            ]
-        })
-        .collect();
-    let poses: Vec<Mat4> = (0..10)
-        .flat_map(|c| [Mat4::IDENTITY, Mat4::from_rotation_z(c as f32 * 0.1)])
-        .collect();
-    let m1 = SkinnedMesh::new(rest.clone(), None, infl.clone(), 2)
-        .unwrap()
-        .with_npu(&one)
-        .unwrap();
-    let m3 = SkinnedMesh::new(rest, None, infl, 2)
-        .unwrap()
-        .with_pool(&pool)
-        .unwrap();
     assert_eq!(
-        m1.skin_batch(&poses).unwrap().positions,
-        m3.skin_batch(&poses).unwrap().positions
+        GerstnerOcean::new(waves, grid)
+            .unwrap()
+            .self_check()
+            .unwrap(),
+        None
+    );
+
+    // Skinning: characters split across the pool.
+    let poses = two_bone_poses(10);
+    let m1 = two_bone_column(100, false).with_npu(&one).unwrap();
+    let m3 = two_bone_column(100, false).with_pool(&pool).unwrap();
+    assert_eq!(
+        m1.skin_batch(&poses).unwrap(),
+        m3.skin_batch(&poses).unwrap()
     );
 
     // Every accelerated type reports a small self-check error.
@@ -234,6 +249,11 @@ fn pools_match_one_npu_and_self_checks_pass() {
             .self_check()
             .unwrap(),
         Dct8x8::new()
+            .with_pool(&pool)
+            .unwrap()
+            .self_check()
+            .unwrap(),
+        IrradianceBaker::new(&[Vec3::Y, Vec3::X])
             .with_pool(&pool)
             .unwrap()
             .self_check()
@@ -252,17 +272,4 @@ fn pools_match_one_npu_and_self_checks_pass() {
         let err = c.expect("accelerated");
         assert!(err < 1e-2, "self-check error {err}");
     }
-}
-
-#[test]
-fn small_irradiance_bakes_stay_exact_on_the_cpu() {
-    // A few probes × normals: Placement::Auto keeps it on the CPU, so the
-    // "NPU" result is exactly the CPU result.
-    let probes = [ShProjector::fibonacci(512)
-        .project_fn(|d| Vec3::new(1.0 + d.y, 0.5, 0.2))
-        .unwrap()];
-    let normals = [Vec3::Y, Vec3::X, Vec3::Z];
-    let a = sh::irradiance_batch(Some(&Npu::simulator()), &probes, &normals).unwrap();
-    let b = sh::irradiance_batch(None, &probes, &normals).unwrap();
-    assert!(max_err(&a, &b) < 1e-5, "{}", max_err(&a, &b));
 }

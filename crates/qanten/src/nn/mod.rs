@@ -31,7 +31,7 @@ mod state_dict;
 pub mod transformer;
 
 pub use layers::*;
-pub use mlp::{ActivationKind, MlpLayerInfo, mlp_from_state_dict};
+pub use mlp::{ActivationKind, MlpLayerInfo};
 pub use state_dict::StateDict;
 
 use crate::error::Result;

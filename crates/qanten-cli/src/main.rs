@@ -101,9 +101,9 @@ enum Command {
         /// Architecture for weight files (.safetensors / .npz).
         #[arg(long, value_enum)]
         arch: Option<run::Arch>,
-        /// Activation between layers for `--arch mlp`.
-        #[arg(long, value_enum, default_value = "relu")]
-        activation: run::Activation,
+        /// Activation between layers for `--arch mlp`: relu, tanh, sigmoid, gelu or silu.
+        #[arg(long, default_value = "relu")]
+        activation: qanten::nn::ActivationKind,
         /// Batch size for random inputs.
         #[arg(long, default_value_t = 1)]
         batch: usize,

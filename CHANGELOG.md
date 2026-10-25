@@ -35,3 +35,27 @@ official toolkit v2.4.0.
   scaling (up to 3.4x lower error), `with_pool(&pool)` on every type,
   `self_check()` via `check_product`, and `sh::irradiance_batch` through
   `compute::gemm` with `Placement::Auto`.
+- Code review pass, less C-like and without duplicated code:
+  - `compute` split into modules; `Matrix` (f32) / `Matrix64` (f64) aliases
+    of a generic `Mat<T>` with row iterators, `matmul_transposed`,
+    `symmetric_eigen`, `orthonormalize_rows`; `gemm`/`gemv`/`check_product`
+    became `Matrix::matmul_on` / `matvec_on` / `product_error` with a
+    `Placement` that carries the NPU; `cos`/`sin`/`mul` are `Npu` methods.
+    One scaling helper serves every NPU product.
+  - `linalg` built on `NpuMatrix`: solvers are `LinearOperator` methods,
+    `Pca::fit(npu, &Matrix64, k)`, one shared CG inner loop.
+  - `signal` built on `NpuMatrix`; `Spectrum` holds matrices;
+    `TemplateMatcher` + `Correlation::matches` replace `correlate` /
+    `find_matches`; `FirBank::apply` returns a `Matrix`.
+  - `train::Dense` stores `Matrix` weights and uses `matmul_on`.
+  - `qanten::rng::SplitMix64` is public (used by the example, graphics and
+    tests instead of private copies).
+  - `nn::Sequential::load_mlp`, `ActivationKind: FromStr + Display`,
+    `StateDict::load_file`, `Tensor::min_max` / `mean`, shared by CLI and server.
+  - `qanten-graphics`: one `MatrixOp` per constant matrix with exact CPU
+    path; per-item inputs/outputs (`skin_batch(&[poses])` → one `Skinned`
+    each, `evaluate_batch(&Matrix)`, `project_batch(&[samples])`,
+    `Dct8x8::forward(&Matrix)`); `IrradianceBaker` replaces `irradiance_batch`.
+  - machine-monitor: `Measurement`, feature `Matrix`, `Confusion`, `Plant`,
+    `Monitor`/`Outcome`; reclassification hysteresis.
+  - CI shows failing doc snippets (they were hidden).

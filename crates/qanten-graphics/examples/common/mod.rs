@@ -144,6 +144,14 @@ pub fn max_err(a: &[Vec3], b: &[Vec3]) -> f32 {
         .fold(0.0, f32::max)
 }
 
+/// Largest [`max_err`] over per-character meshes.
+pub fn max_err_all(a: &[Vec<Vec3>], b: &[Vec<Vec3>]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| max_err(x, y))
+        .fold(0.0, f32::max)
+}
+
 /// Right-handed look-at × OpenGL-style perspective (NDC z in [-1, 1]).
 pub fn view_proj(eye: Vec3, target: Vec3, fov_y: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
     let f = (target - eye).normalize();

@@ -83,6 +83,28 @@ impl FromIterator<(String, Tensor)> for StateDict {
     }
 }
 
+impl StateDict {
+    /// Reads a weight file by its extension: `.safetensors` (feature
+    /// `safetensors`) or `.npz` (feature `numpy`).
+    pub fn load_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            #[cfg(feature = "safetensors")]
+            "safetensors" => Self::load_safetensors(path),
+            #[cfg(feature = "numpy")]
+            "npz" => Self::load_npz(path),
+            other => Err(Error::Unsupported(format!(
+                "cannot read weights from `.{other}` files (supported: .safetensors with the \
+                 `safetensors` feature, .npz with the `numpy` feature)"
+            ))),
+        }
+    }
+}
+
 #[cfg(feature = "safetensors")]
 mod st {
     use half::{bf16, f16};

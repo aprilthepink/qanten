@@ -1,14 +1,15 @@
 //! Signal processing as matrix products on the NPU.
 //!
-//! Each tool keeps one constant matrix resident on the NPU and pushes every
-//! frame or window of the signal through it in a single batched call:
+//! Each tool keeps one constant matrix on the NPU as a
+//! [`compute::NpuMatrix`](crate::compute::NpuMatrix) and pushes every frame
+//! or block of the signal through it in a single batched call:
 //!
 //! | Type | Matrix on the NPU | Vectors streamed |
 //! |---|---|---|
 //! | [`Dft`] | `cos` / `sin` rows of the DFT | frames |
 //! | [`Stft`] | windowed DFT rows | overlapping frames → spectrogram |
 //! | [`FirBank`] | every filter at every shift of a block | signal blocks |
-//! | [`correlate`] | every template at every shift of a block | signal blocks → matches |
+//! | [`TemplateMatcher`] | every template at every shift of a block | signal blocks → matches |
 //!
 //! **Precision.** bfloat16 gives roughly 40–50 dB of dynamic range: plenty
 //! for spectrograms, detection, feature extraction and monitoring, not for
@@ -16,10 +17,11 @@
 //!
 //! ```
 //! # fn main() -> qanten::Result<()> {
+//! use qanten::compute::Matrix;
 //! use qanten::signal::Dft;
 //! let npu = qanten::Npu::simulator();
 //! let n = 64;
-//! let tone: Vec<f32> = (0..n).map(|t| (std::f32::consts::TAU * 5.0 * t as f32 / n as f32).cos()).collect();
+//! let tone = Matrix::from_fn(1, n, |_, t| (std::f32::consts::TAU * 5.0 * t as f32 / n as f32).cos());
 //! let spectrum = Dft::new(&npu, n)?.forward(&tone)?;
 //! assert_eq!(spectrum.peak_bin(0), 5);
 //! # Ok(()) }
@@ -27,71 +29,57 @@
 
 use std::f64::consts::TAU;
 
+use crate::compute::{Matrix, NpuMatrix};
 use crate::device::Npu;
 use crate::error::{Error, Result};
-use crate::ops::LinearWeights;
-use crate::tensor::Tensor;
 
-/// Runs `rows` (row-major, `len` each) through `w`, normalising each row to
-/// unit peak first so bf16 sees O(1) values, then undoing the scale.
-fn apply_scaled(w: &LinearWeights, rows: &[f32], len: usize) -> Result<Vec<f32>> {
-    let k = rows.len() / len.max(1);
-    let mut scales = Vec::with_capacity(k);
-    let mut scaled = Vec::with_capacity(rows.len());
-    for r in rows.chunks(len) {
-        let m = r.iter().fold(0.0f32, |a, v| a.max(v.abs()));
-        let m = if m > 0.0 { m } else { 1.0 };
-        scales.push(m);
-        scaled.extend(r.iter().map(|v| v / m));
-    }
-    let y = w
-        .forward(&Tensor::from_f32(&scaled, [k, len])?)?
-        .to_f32_vec();
-    let out = y.len() / k.max(1);
-    Ok(y.chunks(out.max(1))
-        .zip(&scales)
-        .flat_map(|(r, &m)| r.iter().map(move |v| v * m))
-        .collect())
-}
-
-/// Complex spectra of one or more frames: `bins` values per frame.
+/// Complex spectra of one or more frames.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spectrum {
-    /// Frequency bins per frame.
-    pub bins: usize,
     /// Real parts, `frames × bins`.
-    pub re: Vec<f32>,
+    pub re: Matrix,
     /// Imaginary parts, `frames × bins`.
-    pub im: Vec<f32>,
+    pub im: Matrix,
 }
 
 impl Spectrum {
+    /// Splits DFT output rows `[re | im]` (`frames × 2·bins`).
+    fn from_stacked(y: &Matrix, bins: usize) -> Self {
+        Self {
+            re: y.columns(0..bins),
+            im: y.columns(bins..2 * bins),
+        }
+    }
+
+    /// Frequency bins per frame.
+    pub fn bins(&self) -> usize {
+        self.re.cols()
+    }
+
     /// Number of frames.
     pub fn frames(&self) -> usize {
-        self.re.len() / self.bins.max(1)
+        self.re.rows()
     }
 
     /// Magnitudes `|X|`, `frames × bins`.
-    pub fn magnitude(&self) -> Vec<f32> {
-        self.re
-            .iter()
-            .zip(&self.im)
-            .map(|(r, i)| (r * r + i * i).sqrt())
-            .collect()
+    pub fn magnitude(&self) -> Matrix {
+        let mut m = self.re.clone();
+        m.as_mut_slice()
+            .iter_mut()
+            .zip(self.im.as_slice())
+            .for_each(|(r, i)| *r = r.hypot(*i));
+        m
     }
 
     /// Power in decibels `20·log10(|X| + 1e-12)`, `frames × bins`.
-    pub fn db(&self) -> Vec<f32> {
-        self.magnitude()
-            .iter()
-            .map(|m| 20.0 * (m + 1e-12).log10())
-            .collect()
+    pub fn db(&self) -> Matrix {
+        self.magnitude().map(|m| 20.0 * (m + 1e-12).log10())
     }
 
     /// Bin with the largest magnitude in `frame`.
     pub fn peak_bin(&self, frame: usize) -> usize {
-        let m = self.magnitude();
-        m[frame * self.bins..(frame + 1) * self.bins]
+        self.magnitude()
+            .row(frame)
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))
@@ -99,29 +87,50 @@ impl Spectrum {
     }
 }
 
-/// Discrete Fourier transform of real frames of length `n` (bins `0..=n/2`).
-#[derive(Debug)]
-pub struct Dft {
-    n: usize,
-    bins: usize,
-    /// Rows: `bins` cosine rows then `bins` (negated) sine rows, `n` columns.
-    matrix: LinearWeights,
+/// Periodic Hann window of length `n`.
+pub fn hann(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| (0.5 - 0.5 * (TAU * i as f64 / n as f64).cos()) as f32)
+        .collect()
 }
 
-/// `[cos(2πkt/n) ; −sin(2πkt/n)]` rows times an optional window.
-/// The angle uses `(k·t) mod n` in integers, so it is exact for any `n`.
-fn dft_rows(n: usize, bins: usize, window: Option<&[f32]>) -> Vec<f32> {
-    let mut m = vec![0.0f32; 2 * bins * n];
-    for k in 0..bins {
-        for t in 0..n {
-            let w = window.map_or(1.0, |w| w[t] as f64);
-            let a = TAU * ((k * t) % n) as f64 / n as f64;
-            m[k * n + t] = (a.cos() * w) as f32;
-            m[(bins + k) * n + t] = (-a.sin() * w) as f32;
-        }
-    }
-    m
+/// The `[cos(2πkt/n) ; −sin(2πkt/n)]` DFT rows (`2·bins × n`), times an
+/// optional window, kept on the NPU.
+#[derive(Debug)]
+struct FourierMatrix {
+    n: usize,
+    bins: usize,
+    resident: NpuMatrix,
 }
+
+impl FourierMatrix {
+    fn new(npu: &Npu, n: usize, window: Option<&[f32]>) -> Result<Self> {
+        let bins = n / 2 + 1;
+        // The angle uses (k·t) mod n in integers, so it is exact for any n.
+        let rows = Matrix::from_fn(2 * bins, n, |r, t| {
+            let (k, sine) = (r % bins, r >= bins);
+            let a = TAU * ((k * t) % n) as f64 / n as f64;
+            let w = window.map_or(1.0, |w| w[t] as f64);
+            (if sine { -a.sin() } else { a.cos() } * w) as f32
+        });
+        Ok(Self {
+            n,
+            bins,
+            resident: NpuMatrix::upload(npu, &rows)?,
+        })
+    }
+
+    fn transform(&self, frames: &Matrix) -> Result<Spectrum> {
+        Ok(Spectrum::from_stacked(
+            &self.resident.apply_batch(frames)?,
+            self.bins,
+        ))
+    }
+}
+
+/// Discrete Fourier transform of real frames of length `n` (bins `0..=n/2`).
+#[derive(Debug)]
+pub struct Dft(FourierMatrix);
 
 impl Dft {
     /// A DFT for frames of length `n`, uploaded to `npu`.
@@ -131,17 +140,12 @@ impl Dft {
                 "DFT length must be at least 2".into(),
             ));
         }
-        let bins = n / 2 + 1;
-        let matrix = LinearWeights::upload(
-            npu,
-            &Tensor::from_f32(&dft_rows(n, bins, None), [2 * bins, n])?,
-        )?;
-        Ok(Self { n, bins, matrix })
+        Ok(Self(FourierMatrix::new(npu, n, None)?))
     }
 
     /// Frame length.
     pub fn len(&self) -> usize {
-        self.n
+        self.0.n
     }
 
     /// Always `false` (length ≥ 2).
@@ -149,44 +153,25 @@ impl Dft {
         false
     }
 
-    /// Transforms `frames × n` samples (one or more frames, row-major).
-    pub fn forward(&self, frames: &[f32]) -> Result<Spectrum> {
-        if frames.is_empty() || !frames.len().is_multiple_of(self.n) {
+    /// Transforms every row of `frames` (`frames × n`) in one NPU call.
+    pub fn forward(&self, frames: &Matrix) -> Result<Spectrum> {
+        if frames.cols() != self.0.n || frames.rows() == 0 {
             return Err(Error::Shape(format!(
-                "{} samples is not a whole number of {}-sample frames",
-                frames.len(),
-                self.n
+                "frames must be rows of {} samples, got {}x{}",
+                self.0.n,
+                frames.rows(),
+                frames.cols()
             )));
         }
-        let y = apply_scaled(&self.matrix, frames, self.n)?;
-        let mut re = Vec::with_capacity(y.len() / 2);
-        let mut im = Vec::with_capacity(y.len() / 2);
-        for row in y.chunks(2 * self.bins) {
-            re.extend_from_slice(&row[..self.bins]);
-            im.extend_from_slice(&row[self.bins..]);
-        }
-        Ok(Spectrum {
-            bins: self.bins,
-            re,
-            im,
-        })
+        self.0.transform(frames)
     }
 }
 
 /// Short-time Fourier transform: spectrogram of a long signal.
 #[derive(Debug)]
 pub struct Stft {
-    frame: usize,
     hop: usize,
-    bins: usize,
-    matrix: LinearWeights,
-}
-
-/// Periodic Hann window of length `n`.
-pub fn hann(n: usize) -> Vec<f32> {
-    (0..n)
-        .map(|i| (0.5 - 0.5 * (TAU * i as f64 / n as f64).cos()) as f32)
-        .collect()
+    fourier: FourierMatrix,
 }
 
 impl Stft {
@@ -197,51 +182,29 @@ impl Stft {
                 "frame must be ≥ 2 and hop ≥ 1".into(),
             ));
         }
-        let bins = frame / 2 + 1;
-        let w = hann(frame);
-        let matrix = LinearWeights::upload(
-            npu,
-            &Tensor::from_f32(&dft_rows(frame, bins, Some(&w)), [2 * bins, frame])?,
-        )?;
         Ok(Self {
-            frame,
             hop,
-            bins,
-            matrix,
+            fourier: FourierMatrix::new(npu, frame, Some(&hann(frame)))?,
         })
     }
 
     /// Frequency of `bin` in Hz for a given sample rate.
     pub fn bin_frequency(&self, bin: usize, sample_rate: f32) -> f32 {
-        bin as f32 * sample_rate / self.frame as f32
+        bin as f32 * sample_rate / self.fourier.n as f32
     }
 
     /// Spectrogram of `signal`: every full frame, all in one NPU call.
     pub fn spectrogram(&self, signal: &[f32]) -> Result<Spectrum> {
-        if signal.len() < self.frame {
+        let n = self.fourier.n;
+        if signal.len() < n {
             return Err(Error::Shape(format!(
-                "signal of {} samples is shorter than one frame ({})",
-                signal.len(),
-                self.frame
+                "signal of {} samples is shorter than one frame ({n})",
+                signal.len()
             )));
         }
-        let frames = (signal.len() - self.frame) / self.hop + 1;
-        let mut rows = Vec::with_capacity(frames * self.frame);
-        for f in 0..frames {
-            rows.extend_from_slice(&signal[f * self.hop..f * self.hop + self.frame]);
-        }
-        let y = apply_scaled(&self.matrix, &rows, self.frame)?;
-        let mut re = Vec::with_capacity(frames * self.bins);
-        let mut im = Vec::with_capacity(frames * self.bins);
-        for row in y.chunks(2 * self.bins) {
-            re.extend_from_slice(&row[..self.bins]);
-            im.extend_from_slice(&row[self.bins..]);
-        }
-        Ok(Spectrum {
-            bins: self.bins,
-            re,
-            im,
-        })
+        let count = (signal.len() - n) / self.hop + 1;
+        let frames = Matrix::from_fn(count, n, |f, t| signal[f * self.hop + t]);
+        self.fourier.transform(&frames)
     }
 }
 
@@ -262,66 +225,62 @@ struct BlockCorrelator {
     len: usize,
     kernels: usize,
     block: usize,
-    matrix: LinearWeights,
+    resident: NpuMatrix,
 }
 
 impl BlockCorrelator {
+    /// `kernels` must be non-empty and of equal length (checked by callers).
     fn new(npu: &Npu, kernels: &[Vec<f32>]) -> Result<Self> {
-        let len = kernels.first().map_or(0, Vec::len);
+        let len = kernels[0].len();
         let k = kernels.len();
         let block = len.clamp(32, 256);
-        let width = block + len - 1;
-        // Row (i·K + k): kernel k shifted to output i of the block.
-        let mut m = vec![0.0f32; block * k * width];
-        for i in 0..block {
-            for (kk, g) in kernels.iter().enumerate() {
-                let row = &mut m[(i * k + kk) * width..(i * k + kk + 1) * width];
-                row[i..i + len].copy_from_slice(g);
-            }
-        }
-        let matrix = LinearWeights::upload(npu, &Tensor::from_f32(&m, [block * k, width])?)?;
+        // Row (i·K + kk): kernel kk shifted to output i of the block.
+        let rows = Matrix::from_fn(block * k, block + len - 1, |row, p| {
+            let (i, kk) = (row / k, row % k);
+            p.checked_sub(i)
+                .and_then(|j| kernels[kk].get(j))
+                .copied()
+                .unwrap_or(0.0)
+        });
         Ok(Self {
             len,
             kernels: k,
             block,
-            matrix,
+            resident: NpuMatrix::upload(npu, &rows)?,
         })
     }
 
-    /// `count × K` outputs, row-major, for `count = signal.len() − L + 1`.
-    fn apply(&self, signal: &[f32]) -> Result<Vec<f32>> {
+    /// `count × K` outputs, for `count = signal.len() − L + 1`.
+    fn apply(&self, signal: &[f32]) -> Result<Matrix> {
         let count = signal.len() + 1 - self.len;
         let width = self.block + self.len - 1;
-        let blocks = count.div_ceil(self.block);
-        let mut segments = vec![0.0f32; blocks * width];
-        for (b, seg) in segments.chunks_mut(width).enumerate() {
-            let start = b * self.block;
-            let end = (start + width).min(signal.len());
-            seg[..end - start].copy_from_slice(&signal[start..end]);
-        }
-        let mut y = apply_scaled(&self.matrix, &segments, width)?;
+        let segments = Matrix::from_fn(count.div_ceil(self.block), width, |b, p| {
+            signal.get(b * self.block + p).copied().unwrap_or(0.0)
+        });
+        let mut y = self.resident.apply_batch(&segments)?.into_vec();
         y.truncate(count * self.kernels);
-        Ok(y)
+        Matrix::new(count, self.kernels, y)
     }
+}
+
+fn equal_lengths(kernels: &[Vec<f32>], min: usize) -> Option<usize> {
+    let len = kernels.first()?.len();
+    (len >= min && kernels.iter().all(|k| k.len() == len)).then_some(len)
 }
 
 /// Several FIR filters applied to one signal in a single NPU call.
 #[derive(Debug)]
 pub struct FirBank {
     taps: usize,
-    filters: usize,
     conv: BlockCorrelator,
 }
 
 impl FirBank {
     /// `filters[k]` are the taps `h_k[0..L]` of filter `k` (all the same length).
     pub fn new(npu: &Npu, filters: &[Vec<f32>]) -> Result<Self> {
-        let taps = filters.first().map_or(0, Vec::len);
-        if taps == 0 || filters.iter().any(|f| f.len() != taps) {
-            return Err(Error::InvalidArgument(
-                "filters must be non-empty and of equal length".into(),
-            ));
-        }
+        let taps = equal_lengths(filters, 1).ok_or_else(|| {
+            Error::InvalidArgument("filters must be non-empty and of equal length".into())
+        })?;
         // Convolution y[t] = Σ_j h[j]·x[t−j] is a correlation with h reversed.
         let reversed: Vec<Vec<f32>> = filters
             .iter()
@@ -329,32 +288,26 @@ impl FirBank {
             .collect();
         Ok(Self {
             taps,
-            filters: filters.len(),
             conv: BlockCorrelator::new(npu, &reversed)?,
         })
     }
 
     /// Number of filters.
     pub fn filters(&self) -> usize {
-        self.filters
+        self.conv.kernels
     }
 
-    /// Filters `signal` with every filter. Returns `filters × signal.len()`
-    /// outputs (causal; the first `taps − 1` samples see zero history).
-    pub fn apply(&self, signal: &[f32]) -> Result<Vec<Vec<f32>>> {
+    /// Filters `signal` with every filter. Row `k` of the result is filter
+    /// `k`'s output, `signal.len()` samples (causal; the first `taps − 1`
+    /// samples see zero history).
+    pub fn apply(&self, signal: &[f32]) -> Result<Matrix> {
         if signal.is_empty() {
             return Err(Error::Shape("empty signal".into()));
         }
-        let mut padded = vec![0.0f32; self.taps - 1];
-        padded.extend_from_slice(signal);
-        let y = self.conv.apply(&padded)?; // [T, K]
-        let mut out = vec![Vec::with_capacity(signal.len()); self.filters];
-        for row in y.chunks(self.filters) {
-            for (k, v) in row.iter().enumerate() {
-                out[k].push(*v);
-            }
-        }
-        Ok(out)
+        let padded: Vec<f32> = std::iter::repeat_n(0.0, self.taps - 1)
+            .chain(signal.iter().copied())
+            .collect();
+        Ok(self.conv.apply(&padded)?.transpose())
     }
 }
 
@@ -396,12 +349,15 @@ pub mod design {
     /// Band-pass filter between `low` and `high` (fractions of the sample rate).
     pub fn bandpass(low: f32, high: f32, taps: usize) -> Vec<f32> {
         let lo = lowpass(low, taps);
-        let hi = lowpass(high, taps);
-        hi.iter().zip(&lo).map(|(a, b)| a - b).collect()
+        lowpass(high, taps)
+            .iter()
+            .zip(&lo)
+            .map(|(a, b)| a - b)
+            .collect()
     }
 }
 
-/// A template match found by [`correlate`].
+/// A template match found by [`Correlation::matches`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Match {
     /// Index of the template.
@@ -412,89 +368,117 @@ pub struct Match {
     pub score: f32,
 }
 
-/// Normalised cross-correlation of every template against every position of
-/// `signal`, in one NPU call. Returns `templates × positions` scores in
-/// `[−1, 1]` (Pearson correlation of the template with each window).
-pub fn correlate(npu: &Npu, signal: &[f32], templates: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
-    let len = templates.first().map_or(0, Vec::len);
-    if len < 2 || templates.iter().any(|t| t.len() != len) || signal.len() < len {
-        return Err(Error::InvalidArgument(
-            "templates must have equal length ≥ 2, no longer than the signal".into(),
-        ));
-    }
-    let normalise = |v: &[f32]| -> Vec<f32> {
-        let m = v.iter().sum::<f32>() / v.len() as f32;
-        let c: Vec<f32> = v.iter().map(|x| x - m).collect();
-        let n = c.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if n > 0.0 {
-            c.iter().map(|x| x / n).collect()
-        } else {
-            c
-        }
-    };
-    // Templates are zero-mean, so Σ t·(x − mean) = Σ t·x: the NPU computes the
-    // raw sliding products and the window norms come from prefix sums.
-    let kernels: Vec<Vec<f32>> = templates.iter().map(|t| normalise(t)).collect();
-    let raw = BlockCorrelator::new(npu, &kernels)?.apply(signal)?;
-    let (mut s1, mut s2) = (
-        vec![0.0f64; signal.len() + 1],
-        vec![0.0f64; signal.len() + 1],
-    );
-    for (i, &x) in signal.iter().enumerate() {
-        s1[i + 1] = s1[i] + x as f64;
-        s2[i + 1] = s2[i] + (x as f64) * (x as f64);
-    }
-    let k = templates.len();
-    let y: Vec<f32> = raw
-        .chunks(k)
-        .enumerate()
-        .flat_map(|(t, row)| {
-            let sum = s1[t + len] - s1[t];
-            let var = (s2[t + len] - s2[t] - sum * sum / len as f64).max(0.0);
-            let norm = var.sqrt();
-            row.iter().map(move |&v| {
-                if norm > 1e-12 {
-                    (v as f64 / norm).clamp(-1.0, 1.0) as f32
-                } else {
-                    0.0
-                }
-            })
-        })
-        .collect();
-    let mut out = vec![Vec::with_capacity(y.len() / k); k];
-    for row in y.chunks(k) {
-        for (t, v) in row.iter().enumerate() {
-            out[t].push(*v);
-        }
-    }
-    Ok(out)
+/// Finds known shapes in signals by normalised cross-correlation. The
+/// templates stay on the NPU, so the same matcher scans any number of signals.
+#[derive(Debug)]
+pub struct TemplateMatcher {
+    len: usize,
+    conv: BlockCorrelator,
 }
 
-/// Positions where a template's correlation is above `threshold` and a local
-/// maximum (closer peaks than the template length are merged), best first.
-pub fn find_matches(scores: &[Vec<f32>], template_len: usize, threshold: f32) -> Vec<Match> {
-    let mut found = Vec::new();
-    for (t, s) in scores.iter().enumerate() {
-        let mut i = 0;
-        while i < s.len() {
-            if s[i] >= threshold {
-                let end = (i + template_len).min(s.len());
+/// Zero-mean, unit-norm copy (all zeros for a constant input).
+fn normalised(v: &[f32]) -> Vec<f32> {
+    let mean = v.iter().sum::<f32>() / v.len() as f32;
+    let centred: Vec<f32> = v.iter().map(|x| x - mean).collect();
+    let norm = centred.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        centred.iter().map(|x| x / norm).collect()
+    } else {
+        centred
+    }
+}
+
+impl TemplateMatcher {
+    /// Uploads `templates` (equal length ≥ 2).
+    pub fn new(npu: &Npu, templates: &[Vec<f32>]) -> Result<Self> {
+        let len = equal_lengths(templates, 2)
+            .ok_or_else(|| Error::InvalidArgument("templates must have equal length ≥ 2".into()))?;
+        let kernels: Vec<Vec<f32>> = templates.iter().map(|t| normalised(t)).collect();
+        Ok(Self {
+            len,
+            conv: BlockCorrelator::new(npu, &kernels)?,
+        })
+    }
+
+    /// Template length.
+    pub fn template_len(&self) -> usize {
+        self.len
+    }
+
+    /// Pearson correlation of every template with every window of `signal`,
+    /// in one NPU call.
+    pub fn scores(&self, signal: &[f32]) -> Result<Correlation> {
+        if signal.len() < self.len {
+            return Err(Error::InvalidArgument(format!(
+                "signal of {} samples is shorter than the templates ({})",
+                signal.len(),
+                self.len
+            )));
+        }
+        // Templates are zero-mean, so Σ t·(x − mean) = Σ t·x: the NPU computes
+        // the raw sliding products and the window norms come from prefix sums.
+        let raw = self.conv.apply(signal)?;
+        let (mut s1, mut s2) = (vec![0.0f64], vec![0.0f64]);
+        for &x in signal {
+            s1.push(s1[s1.len() - 1] + x as f64);
+            s2.push(s2[s2.len() - 1] + (x as f64).powi(2));
+        }
+        let n = self.len as f64;
+        let mut scores = raw.transpose(); // templates × positions
+        for row in scores.iter_rows_mut() {
+            for (t, v) in row.iter_mut().enumerate() {
+                let sum = s1[t + self.len] - s1[t];
+                let var = (s2[t + self.len] - s2[t] - sum * sum / n).max(0.0);
+                *v = if var > 1e-24 {
+                    (*v as f64 / var.sqrt()).clamp(-1.0, 1.0) as f32
+                } else {
+                    0.0
+                };
+            }
+        }
+        Ok(Correlation {
+            scores,
+            template_len: self.len,
+        })
+    }
+}
+
+/// Correlation scores of a [`TemplateMatcher`] against one signal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Correlation {
+    /// `templates × positions` scores in `[−1, 1]`.
+    pub scores: Matrix,
+    template_len: usize,
+}
+
+impl Correlation {
+    /// Positions where a template's correlation is above `threshold` and a
+    /// local maximum (peaks closer than the template length are merged),
+    /// best first.
+    pub fn matches(&self, threshold: f32) -> Vec<Match> {
+        let mut found = Vec::new();
+        for (template, s) in self.scores.iter_rows().enumerate() {
+            let mut i = 0;
+            while i < s.len() {
+                if s[i] < threshold {
+                    i += 1;
+                    continue;
+                }
+                let end = (i + self.template_len).min(s.len());
                 let (best, &score) = s[i..end]
                     .iter()
                     .enumerate()
                     .max_by(|a, b| a.1.total_cmp(b.1))
                     .unwrap_or((0, &s[i]));
                 found.push(Match {
-                    template: t,
+                    template,
                     offset: i + best,
                     score,
                 });
-                i = i + best + template_len;
-            } else {
-                i += 1;
+                i += best + self.template_len;
             }
         }
+        found.sort_by(|a, b| b.score.total_cmp(&a.score));
+        found
     }
-    found.sort_by(|a, b| b.score.total_cmp(&a.score));
-    found
 }

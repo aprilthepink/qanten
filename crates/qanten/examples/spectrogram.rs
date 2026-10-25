@@ -9,7 +9,8 @@ use std::f32::consts::TAU;
 use std::time::Instant;
 
 use qanten::Npu;
-use qanten::signal::{self, Stft};
+use qanten::rng::SplitMix64;
+use qanten::signal::{Stft, TemplateMatcher};
 
 fn main() -> anyhow::Result<()> {
     let out = std::env::args()
@@ -20,13 +21,7 @@ fn main() -> anyhow::Result<()> {
 
     let rate = 16_000.0f32;
     let n = (rate * 3.0) as usize;
-    let mut seed = 1u64;
-    let mut noise = move || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
-    };
+    let mut rng = SplitMix64::new(1);
     let click: Vec<f32> = (0..96)
         .map(|i| (-(i as f32) / 12.0).exp() * (TAU * 7000.0 * i as f32 / rate).sin())
         .collect();
@@ -42,7 +37,7 @@ fn main() -> anyhow::Result<()> {
                 .iter()
                 .filter_map(|&p| t.checked_sub(p).and_then(|i| click.get(i)))
                 .sum::<f32>();
-            chirp + warble + hum + 1.5 * c + 0.05 * noise()
+            chirp + warble + hum + 1.5 * c + rng.uniform(-0.025, 0.025)
         })
         .collect();
 
@@ -52,12 +47,12 @@ fn main() -> anyhow::Result<()> {
     println!(
         "spectrogram: {} frames × {} bins in {:.1} ms (one NPU call)",
         spec.frames(),
-        spec.bins,
+        spec.bins(),
         start.elapsed().as_secs_f64() * 1e3
     );
 
-    let scores = signal::correlate(&npu, &sig, std::slice::from_ref(&click))?;
-    let mut hits = signal::find_matches(&scores, click.len(), 0.35);
+    let matcher = TemplateMatcher::new(&npu, std::slice::from_ref(&click))?;
+    let mut hits = matcher.scores(&sig)?.matches(0.35);
     hits.sort_by_key(|m| m.offset);
     println!(
         "clicks found at samples: {:?} (inserted at {click_at:?})",
@@ -65,9 +60,9 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Render: time → x, frequency → y (low at the bottom), dB → colour.
-    let (w, h) = (spec.frames(), spec.bins);
+    let (w, h) = (spec.frames(), spec.bins());
     let db = spec.db();
-    let top = db.iter().copied().fold(f32::MIN, f32::max);
+    let top = db.as_slice().iter().copied().fold(f32::MIN, f32::max);
     let colour = |v: f32| -> [u8; 3] {
         let t = ((v - top + 70.0) / 70.0).clamp(0.0, 1.0);
         let stops = [
@@ -86,10 +81,9 @@ fn main() -> anyhow::Result<()> {
         [c[0], c[1], c[2]]
     };
     let mut pixels = Vec::with_capacity(w * h * 3);
-    for y in 0..h {
-        let bin = h - 1 - y;
-        for x in 0..w {
-            pixels.extend(colour(db[x * h + bin]));
+    for bin in (0..h).rev() {
+        for frame in 0..w {
+            pixels.extend(colour(db[(frame, bin)]));
         }
     }
     let file = std::io::BufWriter::new(std::fs::File::create(&out)?);

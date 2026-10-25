@@ -4,27 +4,36 @@
 //!
 //! `vertex = base + Σ_s weight_s · delta_s`. The delta matrix
 //! `[3·vertices, shapes]` is uploaded once and stays resident; each frame
-//! only the weights of every character go up (`characters × shapes` values).
+//! only the weights of every character go up (one row of `shapes` values per
+//! character).
 //! Only the offsets pass through the NPU, the base mesh is added in f32 on
 //! the host, so the bf16 error scales with the deformation, not the mesh size.
 
 use glam::Vec3;
-use rayon::prelude::*;
+use qanten::compute::Matrix;
 
-use crate::accel::{ResidentMatrix, Target};
-use qanten::pool::NpuPool;
-
-use crate::{Error, Npu, Result};
+use crate::accel::{Accelerated, MatrixOp, accelerated_methods};
+use crate::{Error, Result};
 
 /// A base mesh plus morph-target offsets.
 #[derive(Debug)]
 pub struct Blendshapes {
     base: Vec<Vec3>,
-    /// Row-major `[3·V, S]`: row `3v + c`, column `s` = component `c` of target `s`'s offset at vertex `v`.
-    deltas: Vec<f32>,
+    /// `[3·V, S]`: row `3v + c`, column `s` = component `c` of target `s`'s offset at vertex `v`.
+    deltas: MatrixOp,
     shapes: usize,
-    npu: Option<ResidentMatrix>,
 }
+
+impl Accelerated for Blendshapes {
+    fn ops(&self) -> Vec<&MatrixOp> {
+        vec![&self.deltas]
+    }
+    fn ops_mut(&mut self) -> Vec<&mut MatrixOp> {
+        vec![&mut self.deltas]
+    }
+}
+
+accelerated_methods!(Blendshapes);
 
 impl Blendshapes {
     /// `deltas[s][v]` is the offset of target `s` at vertex `v`.
@@ -33,20 +42,11 @@ impl Blendshapes {
         if deltas.iter().any(|d| d.len() != v) {
             return Err(Error::Shape(format!("every target needs {v} offsets")));
         }
-        let shapes = deltas.len();
-        let mut m = vec![0.0f32; 3 * v * shapes];
-        for (s, target) in deltas.iter().enumerate() {
-            for (vi, d) in target.iter().enumerate() {
-                for c in 0..3 {
-                    m[(3 * vi + c) * shapes + s] = d[c];
-                }
-            }
-        }
+        let matrix = Matrix::from_fn(3 * v, deltas.len(), |r, s| deltas[s][r / 3][r % 3]);
         Ok(Self {
             base,
-            deltas: m,
-            shapes,
-            npu: None,
+            deltas: MatrixOp::new(matrix),
+            shapes: deltas.len(),
         })
     }
 
@@ -57,35 +57,6 @@ impl Blendshapes {
             .map(|t| t.iter().zip(&base).map(|(p, b)| *p - *b).collect())
             .collect();
         Self::new(base, &deltas)
-    }
-
-    /// Uploads the delta matrix to `npu`.
-    pub fn with_npu(self, npu: &Npu) -> Result<Self> {
-        self.upload_to(Target::Npu(npu))
-    }
-
-    /// Like [`with_npu`](Self::with_npu), but with a full copy on every NPU of
-    /// `pool`; each batch is split between them, so they all work at once.
-    pub fn with_pool(self, pool: &NpuPool) -> Result<Self> {
-        self.upload_to(Target::Pool(pool))
-    }
-
-    /// NPU self-test: relative error of the resident matrices on random
-    /// vectors, checked on the CPU with
-    /// [`qanten::compute::check_product`]. `None` on the CPU path. Run it now
-    /// and then on hardware: a rising value means the NPU needs recalibration.
-    pub fn self_check(&self) -> Result<Option<f64>> {
-        self.npu.as_ref().map(|m| m.self_check(1)).transpose()
-    }
-
-    fn upload_to(mut self, target: Target<'_>) -> Result<Self> {
-        self.npu = Some(ResidentMatrix::upload(
-            target,
-            &self.deltas,
-            3 * self.base.len(),
-            self.shapes,
-        )?);
-        Ok(self)
     }
 
     /// Vertices in the base mesh.
@@ -100,57 +71,45 @@ impl Blendshapes {
 
     /// One character: `weights` has one value per shape.
     pub fn evaluate(&self, weights: &[f32]) -> Result<Vec<Vec3>> {
-        self.evaluate_batch(weights)
+        let one = Matrix::new(1, weights.len(), weights.to_vec())?;
+        Ok(self.evaluate_batch(&one)?.remove(0))
     }
 
-    /// Many characters: `weights` is `characters × shapes`, row-major.
-    /// Returns `characters × vertices` positions.
-    pub fn evaluate_batch(&self, weights: &[f32]) -> Result<Vec<Vec3>> {
-        let chars = self.check(weights)?;
-        let Some(m) = &self.npu else {
-            return Ok(self.evaluate_batch_cpu(weights));
-        };
-        let offsets = m.apply(weights, chars)?; // [chars, 3V]
-        Ok(self.add_base(&offsets, chars))
+    /// Many characters at once: one row of weights per character
+    /// (`characters × shapes`). Returns one mesh per character.
+    pub fn evaluate_batch(&self, weights: &Matrix) -> Result<Vec<Vec<Vec3>>> {
+        self.check(weights)?;
+        Ok(self.add_base(&self.deltas.apply(weights)?))
     }
 
-    /// CPU reference / fallback.
-    pub fn evaluate_batch_cpu(&self, weights: &[f32]) -> Vec<Vec3> {
-        let chars = weights.len() / self.shapes.max(1);
-        let s = self.shapes;
-        let mut offsets = vec![0.0f32; chars * 3 * self.base.len()];
-        offsets
-            .par_chunks_mut(3 * self.base.len().max(1))
-            .enumerate()
-            .for_each(|(c, out)| {
-                let w = &weights[c * s..(c + 1) * s];
-                for (r, o) in out.iter_mut().enumerate() {
-                    let row = &self.deltas[r * s..(r + 1) * s];
-                    *o = row.iter().zip(w).map(|(a, b)| a * b).sum();
-                }
-            });
-        self.add_base(&offsets, chars)
+    /// CPU reference / fallback (exact).
+    pub fn evaluate_batch_cpu(&self, weights: &Matrix) -> Result<Vec<Vec<Vec3>>> {
+        self.check(weights)?;
+        Ok(self.add_base(&self.deltas.apply_cpu(weights)?))
     }
 
-    fn check(&self, weights: &[f32]) -> Result<usize> {
-        if self.shapes == 0 || !weights.len().is_multiple_of(self.shapes) {
+    fn check(&self, weights: &Matrix) -> Result<()> {
+        if weights.cols() != self.shapes || weights.rows() == 0 {
             return Err(Error::Shape(format!(
-                "{} weights is not a multiple of {} shapes",
-                weights.len(),
-                self.shapes
+                "weights must be rows of {} values (one per shape), got {}x{}",
+                self.shapes,
+                weights.rows(),
+                weights.cols()
             )));
         }
-        Ok(weights.len() / self.shapes)
+        Ok(())
     }
 
-    fn add_base(&self, offsets: &[f32], chars: usize) -> Vec<Vec3> {
-        let v = self.base.len();
-        (0..chars * v)
-            .into_par_iter()
-            .map(|k| {
-                let (c, vi) = (k / v, k % v);
-                let o = &offsets[c * 3 * v + 3 * vi..][..3];
-                self.base[vi] + Vec3::new(o[0], o[1], o[2])
+    /// Base mesh plus each character's offsets (`characters × 3V`).
+    fn add_base(&self, offsets: &Matrix) -> Vec<Vec<Vec3>> {
+        offsets
+            .iter_rows()
+            .map(|row| {
+                self.base
+                    .iter()
+                    .zip(row.chunks_exact(3))
+                    .map(|(b, o)| *b + Vec3::from_slice(o))
+                    .collect()
             })
             .collect()
     }

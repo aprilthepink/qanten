@@ -29,13 +29,14 @@ fn main() -> qanten::Result<()> {
         .collect();
     let mesh = SkinnedMesh::new(rest, normals, influences, 2)?.with_npu(&npu)?;
 
-    // Skinning matrices (animated world × inverse bind) for 3 characters × 2 bones.
-    let poses: Vec<Mat4> = (0..3)
-        .flat_map(|c| [Mat4::IDENTITY, Mat4::from_rotation_z(0.3 * c as f32)])
+    // Skinning matrices (animated world × inverse bind): one pose per character.
+    let poses: Vec<[Mat4; 2]> = (0..3)
+        .map(|c| [Mat4::IDENTITY, Mat4::from_rotation_z(0.3 * c as f32)])
         .collect();
-    let out = mesh.skin_batch(&poses)?;
-    assert_eq!(out.positions.len(), 3 * 100);   // characters × vertices
-    assert_eq!(out.normals.len(), 3 * 100);
+    let characters = mesh.skin_batch(&poses)?;  // one `Skinned` per character
+    assert_eq!(characters.len(), 3);
+    assert_eq!(characters[0].positions.len(), 100);
+    assert_eq!(characters[0].normals.len(), 100);
     Ok(())
 }
 ```
@@ -46,9 +47,11 @@ fn main() -> qanten::Result<()> {
 |---|---|
 | `Influences = [(u16, f32); 4]` | up to 4 `(bone, weight)` pairs per vertex; weights are renormalised |
 | `SkinnedMesh::new(rest, normals, influences, bones)` | validates bone indices; normals are optional |
-| `.with_npu(&npu)` | uploads the constant skinning matrices |
-| `skin(&bones)` / `skin_batch(&poses)` | one character / `characters × bones` matrices → `Skinned { positions, normals }` |
+| `.with_npu(&npu)` / `.with_pool(&pool)` | builds and uploads the constant skinning matrices |
+| `skin(&bones)` | one character's bone matrices → `Skinned { positions, normals }` |
+| `skin_batch(&poses)` | `poses[c]` = character `c`'s bone matrices (any `&[impl AsRef<[Mat4]>]`) → one `Skinned` per character |
 | `skin_batch_cpu(&poses)` | standard LBS on the CPU (reference) |
+| `self_check()`, `is_accelerated()` | NPU accuracy check, whether it's uploaded |
 
 Bone matrices are the usual skinning matrices: the bone's animated world transform
 times its inverse bind matrix.

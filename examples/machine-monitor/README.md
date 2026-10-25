@@ -29,7 +29,7 @@ It uses these parts of the library:
 | `qanten::signal` (`FirBank`, `Dft`, `hann`, `design`) | the vibration-analysis front end |
 | `qanten::train` (`Dense`, `Adam`, `cross_entropy`) | training the classifier with the NPU in the loop |
 | `qanten::nn` (`Linear`, `Sequential`, `Module`, `StateDict`) | the deployed model, saved as `.safetensors` |
-| `qanten::compute` (`gemm`, `Placement::Auto`, `NpuMatrix`, `check_product`) | novelty detector: training covariance, resident scoring matrix, daily NPU self-check |
+| `qanten::compute` (`Matrix::matmul_on`, `Placement::auto`, `NpuMatrix`, `Matrix::product_error`) | novelty detector: training covariance, resident scoring matrix, daily NPU self-check |
 | `qanten::pool` (`NpuPool`, `replicate`) | one pipeline copy per NPU, each hour's batch split across them |
 | `qanten::profile` | per-NPU calls, MACs and bytes |
 | `qanten-serve` (`AppState::add_module`, `router`) | HTTP API with dynamic batching, plus a custom route |
@@ -49,16 +49,16 @@ features on the NPU, trains for 40 epochs, fits the novelty detector and
 writes `model.safetensors`. Then it tests on machines it has never seen:
 
 ```text
-simulated and featurised 2400 training windows in 3.8 s
-trained in 1.9 s
-novelty detector: 42 components explain 90.3% of the variance; covariance on the NPU (checked error 2.3e-3); ...
-test set, all severities: 606 windows, accuracy 97.9%
-test set, early faults (severity 0.2-0.4): 606 windows, accuracy 93.6%
+simulated and featurised 2400 training windows in 4.0 s
+trained in 3.2 s
+novelty detector: 42 components explain 90.2% of the variance; covariance on the NPU (checked error 2.1e-3); ...
+test set, all severities: 606 windows, accuracy 99.0%
+test set, early faults (severity 0.2-0.4): 606 windows, accuracy 94.4%
    true \ pred      healthy    imbalance misalignment    looseness   outer-race   inner-race   recall
-       healthy           99            0            1            1            0            0    98.0%
+       healthy           99            0            0            1            0            1    98.0%
      ...
-novelty (score > 1): 0.5% of known-condition windows, 46.5% of cavitation windows
-  (a fault the classifier never saw; it called them: outer-race 2, inner-race 99)
+novelty (score > 1): 1.2% of known-condition windows, 56.4% of cavitation windows
+  (a fault the classifier never saw; it called them: outer-race 46, inner-race 55)
 ```
 
 Most classifier mistakes are early faults that look healthy, which is what
@@ -73,11 +73,11 @@ compute module the way its guide recommends:
 
 | Step | Where it runs | Why |
 |---|---|---|
-| Covariance of the 2,400 × 92 training features, `ZᵀZ` | `compute::gemm(.., Placement::Auto)`: NPU | 20M multiply-accumulates, the device-held matrix reused for 92 vectors |
-| Checking that product | `compute::check_product`, CPU | `O(n²)` Freivalds check; reports 2.3e-3 relative error |
+| Covariance of the 2,400 × 92 training features, `ZᵀZ` | `z_t.matmul_on(&z, Placement::auto(&npu))`: NPU | 20M multiply-accumulates, the device-held matrix reused for 92 vectors |
+| Checking that product | `gram.product_error(..)`, CPU | `O(n²)` Freivalds check; reports 2.1e-3 relative error |
 | Eigenvectors of the 92 × 92 covariance | CPU (Jacobi) | a small matrix used once has no reuse, so it is CPU work |
 | Scoring every window | one `NpuMatrix` on each NPU, `apply_batch` | the matrix stays on the device; every batch streams through it |
-| Daily self-check | `NoveltyDetector::self_check` → `check_product` | watches the analog NPU's accuracy in production |
+| Daily self-check | `NoveltyDetector::self_check` → `Matrix::product_error` | watches the analog NPU's accuracy in production |
 
 The resident matrix stacks two blocks, so one batched call gives both
 classic statistics:
@@ -106,29 +106,34 @@ cavitation, which the classifier has never seen. Each hour the 24 windows
 go to the NPUs as one batch, and alarms print as they fire:
 
 ```text
-day  3 18:00  ALARM   conveyor-01    looseness     86%          -> check mounting bolts and fits
-day  5 09:00  ALARM   pump-03        outer-race    47%          -> plan bearing replacement
-day  5 13:00  UPDATE  pump-03        inner-race    74%          -> plan bearing replacement (urgent)
-day  6 05:00  UPDATE  pump-03        unrecognised  novelty 1.1  -> unknown pattern: send an analyst / inspect on site
+day  4 06:00  ALARM   mixer-01       looseness     85%          -> check mounting bolts and fits
+day  8 01:00  ALARM   compressor-04  inner-race    76%          -> plan bearing replacement (urgent)
 ...
-pump-03        cavitation from day  4 07:00     outer-race at day  5 09:00      18%   0%  detected (new fault type)
+day 11 10:00  UPDATE  compressor-04  unrecognised  novelty 1.0  -> unknown pattern: send an analyst / inspect on site
+...
+compressor-04  cavitation from day  7 00:00     inner-race at day  8 01:00      13%   0%  detected (new fault type)
 8/8 faults found with the right diagnosis, 0 with the wrong one, 0 missed, 0 false alarm(s)
-daily NPU self-checks: worst relative error 0.33%
+daily NPU self-checks: worst relative error 0.42%
 ```
 
-pump-03 shows the two models working together. The classifier raises a
-bearing alarm early, at 18% fault severity, so someone looks at the
+compressor-04 shows the two models working together. The classifier raises a
+bearing alarm early, at 13% fault severity, so someone looks at the
 machine. As the cavitation grows, the novelty score stays high and the alarm
 changes to "unrecognised", telling maintenance that this is not a standard
 bearing job. A sustained high novelty score overrides the classifier,
 because outside its training data its probabilities mean little.
 
+An active alarm only switches to a different known fault after that fault
+has clearly led (by 20 points) for 3 hours in a row, so two similar
+diagnoses (here outer and inner race) don't flip-flop.
+
 The final table compares every alarm with the ground truth, including how
-far each fault had developed when it was caught. Across other `--seed`
-values every fault is still found. A few runs include one false alarm: a
-healthy machine that the classifier, not the novelty detector, mistakes
-for a fault for 3 hours in a row. Raise `CONFIRM_HOURS` in `src/fleet.rs`
-to trade warning time for fewer false alarms.
+far each fault had developed when it was caught. Across `--seed 1` to `6`
+every fault is found. Two runs include one false alarm (a healthy machine
+the classifier mistakes for a fault for 3 hours in a row), and in one run
+two looseness faults that grow past the training range end up flagged as
+"unrecognised" instead of looseness. Raise `CONFIRM_HOURS` in
+`src/fleet.rs` to trade warning time for fewer false alarms.
 
 ## 3. Serve it
 

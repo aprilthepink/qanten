@@ -171,7 +171,7 @@ impl AppState {
     }
 
     /// Loads a model file under `name`: `.onnx`, or `.safetensors` / `.npz`
-    /// (an MLP, see [`nn::mlp_from_state_dict`]). Must be called inside a tokio runtime.
+    /// (an MLP, see [`nn::Sequential::load_mlp`]). Must be called inside a tokio runtime.
     pub fn add_model_file(
         &mut self,
         name: &str,
@@ -212,15 +212,11 @@ impl AppState {
                 )
             }
             "safetensors" | "npz" => {
-                let sd = if ext == "npz" {
-                    StateDict::load_npz(path)?
-                } else {
-                    StateDict::load_safetensors(path)?
-                };
+                let sd = StateDict::load_file(path)?;
                 let mut replicas: Vec<Arc<dyn Runner>> = Vec::new();
                 let mut in_features = 0;
                 for npu in self.pool.npus() {
-                    let (model, info) = nn::mlp_from_state_dict(npu, &sd, activation)?;
+                    let (model, info) = nn::Sequential::load_mlp(npu, &sd, activation)?;
                     in_features = info[0].in_features;
                     replicas.push(Arc::new(ModuleRunner(Box::new(model))));
                 }

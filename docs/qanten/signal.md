@@ -14,7 +14,7 @@ windows of a signal through it in a single batched call.
 | `Dft` | DFT `cos` / `sin` rows | frames |
 | `Stft` | Hann-windowed DFT rows | overlapping frames → spectrogram |
 | `FirBank` | every filter at every shift within a block | signal blocks |
-| `correlate` | every template at every shift within a block | signal blocks → match scores |
+| `TemplateMatcher` | every template at every shift within a block | signal blocks → match scores |
 
 ## Spectrograms
 
@@ -35,9 +35,10 @@ fn main() -> qanten::Result<()> {
 }
 ```
 
-`Dft::new(npu, n).forward(&frames)` does the same for back-to-back frames without a
-window. `Spectrum` holds `re` / `im` (`frames × bins`, bins `0..=n/2`) and has
-`magnitude()`, `db()` and `peak_bin(frame)`. Angles use `(k·t) mod n` in integer
+`Dft::new(npu, n).forward(&frames)` transforms every row of a `compute::Matrix`
+(`frames × n`) without a window. `Spectrum` holds `re` / `im` as `Matrix`es
+(`frames × bins`, bins `0..=n/2`) and has `bins()`, `frames()`, `magnitude()`, `db()`
+and `peak_bin(frame)`. Angles use `(k·t) mod n` in integer
 arithmetic, so the matrix is exact for any length.
 
 ## Filter banks
@@ -54,8 +55,8 @@ fn main() -> qanten::Result<()> {
         design::highpass(0.3, 101),
     ])?;
     let signal = vec![0.0f32; 4000];
-    let outputs = bank.apply(&signal)?;    // 3 filtered signals, same length, causal
-    assert_eq!(outputs.len(), 3);
+    let outputs = bank.apply(&signal)?;    // Matrix: row k = filter k's output, causal
+    assert_eq!(outputs.shape(), (3, 4000));
     Ok(())
 }
 ```
@@ -66,7 +67,7 @@ All filters run in one NPU call over all samples. The signal goes over as blocks
 ## Template matching
 
 ```rust
-use qanten::signal;
+use qanten::signal::TemplateMatcher;
 use qanten::Npu;
 
 fn main() -> qanten::Result<()> {
@@ -74,15 +75,17 @@ fn main() -> qanten::Result<()> {
     let template: Vec<f32> = (0..32).map(|i| ((i as f32) * 0.7).sin()).collect();
     let mut sig = vec![0.0f32; 1000];
     sig[400..432].copy_from_slice(&template);
-    let scores = signal::correlate(&npu, &sig, &[template])?;  // Pearson correlation per position
-    let found = signal::find_matches(&scores, 32, 0.8);
+    let matcher = TemplateMatcher::new(&npu, &[template])?;   // templates stay on the NPU
+    let found = matcher.scores(&sig)?.matches(0.8);           // Pearson correlation, local maxima
     assert_eq!(found[0].offset, 400);
     Ok(())
 }
 ```
 
-`correlate` returns normalised scores in `[−1, 1]` for every template at every
-position; `find_matches` picks local maxima above a threshold.
+`matcher.scores(&signal)` returns a `Correlation` whose `scores` matrix holds normalised
+values in `[−1, 1]` for every template at every position; `.matches(threshold)` picks
+local maxima above a threshold. The same matcher scans any number of signals without
+uploading the templates again.
 
 A correlation detector only knows the template's waveform. A strong signal at the same
 frequency as the template (in the example: the chirp sweeping through the click

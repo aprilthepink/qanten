@@ -8,13 +8,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use machine_monitor::features::FeatureExtractor;
-use machine_monitor::fleet::{self, AlarmTracker, Diagnosis, Event};
-use machine_monitor::model::{self, Dataset, TrainConfig};
+use machine_monitor::fleet::{Diagnosis, Monitor, Plant};
+use machine_monitor::model::{self, Confusion, Dataset, TrainConfig};
 use machine_monitor::{Assessment, Condition, Diagnoser, INPUT_WIDTH, Machine, OUTPUT_WIDTH};
+use qanten::Npu;
+use qanten::compute::Matrix;
 use qanten::nn::{Module, StateDict};
 use qanten::pool::NpuPool;
 use qanten::profile::Profiler;
-use qanten::{Npu, Tensor};
 
 #[derive(Parser)]
 #[command(
@@ -93,25 +94,6 @@ fn open_pool(cli: &Cli) -> Result<NpuPool> {
     Ok(NpuPool::simulated(cli.sim_npus)?)
 }
 
-fn print_confusion(m: &[Vec<usize>]) {
-    print!("{:>14}", "true \\ pred");
-    for c in Condition::ALL {
-        print!("{:>13}", c.label());
-    }
-    println!("{:>9}", "recall");
-    for (c, row) in Condition::ALL.iter().zip(m) {
-        print!("{:>14}", c.label());
-        for v in row {
-            print!("{v:>13}");
-        }
-        let total: usize = row.iter().sum();
-        println!(
-            "{:>8.1}%",
-            100.0 * row[c.index()] as f32 / total.max(1) as f32
-        );
-    }
-}
-
 fn train(npu: &Npu, out: &Path, per_class: usize, epochs: usize) -> Result<()> {
     let extractor = FeatureExtractor::new(npu)?;
     let t = Instant::now();
@@ -138,7 +120,8 @@ fn train(npu: &Npu, out: &Path, per_class: usize, epochs: usize) -> Result<()> {
     println!("trained in {:.1} s", t.elapsed().as_secs_f64());
 
     // Novelty detector: PCA model of the training features (qanten::compute).
-    let validation = Dataset::generate(&extractor, per_class / 4 + 1, (0.2, 1.0), 7)?;
+    let test_size = per_class / 4 + 1;
+    let validation = Dataset::generate(&extractor, test_size, (0.2, 1.0), 7)?;
     let fit = model::add_novelty(npu, &mut sd, &data, &validation)?;
     println!(
         "novelty detector: {} components explain {:.1}% of the variance; covariance on the {} \
@@ -155,44 +138,29 @@ fn train(npu: &Npu, out: &Path, per_class: usize, epochs: usize) -> Result<()> {
 
     // Evaluate the deployed pipeline on machines it has never seen.
     let diag = Diagnoser::load(npu, &sd)?;
-    for (name, range) in [
+    for (name, severity) in [
         ("all severities", (0.2, 1.0)),
         ("early faults (severity 0.2-0.4)", (0.2, 0.4)),
     ] {
-        let test = Dataset::generate(&extractor, per_class / 4 + 1, range, 99)?;
-        let probs = diag.classify_features(&test.features)?;
-        let acc = qanten::train::accuracy(&probs, &test.labels);
+        let test = Dataset::generate(&extractor, test_size, severity, 99)?;
+        let confusion = Confusion::new(&diag.classify_features(&test.features)?, &test.labels);
         println!(
-            "\ntest set, {name}: {} windows, accuracy {:.1}%",
+            "\ntest set, {name}: {} windows, accuracy {:.1}%\n{confusion}",
             test.len(),
-            100.0 * acc
+            100.0 * confusion.accuracy()
         );
-        print_confusion(&model::confusion(&probs, &test.labels));
     }
 
     // How well the novelty score separates known conditions from an unseen fault.
-    let known = Dataset::generate(&extractor, per_class / 4 + 1, (0.2, 1.0), 99)?;
-    let known_flagged = flagged(&diag.novelty_scores(&known.features)?);
-    let mut rng = machine_monitor::sim::Rng::new(5);
-    let unseen: Vec<(f32, Vec<f32>)> = (0..per_class / 4 + 1)
-        .map(|_| {
-            let m = Machine::random(rng.next_u64());
-            let sev = rng.uniform(0.3, 1.0);
-            (
-                m.shaft_hz,
-                m.measure(Condition::Cavitation, sev, rng.next_u64()),
-            )
-        })
-        .collect();
-    let rows: Vec<(f32, &[f32])> = unseen.iter().map(|(f, x)| (*f, x.as_slice())).collect();
-    let assessed = diag.assess(&rows)?;
-    let novelty: Vec<f32> = assessed.iter().map(|a| a.novelty).collect();
-    let mut called = [0usize; 6];
-    for a in &assessed {
-        let best = (0..6)
-            .max_by(|&i, &j| a.probs[i].total_cmp(&a.probs[j]))
-            .unwrap_or(0);
-        called[best] += 1;
+    let flagged = |scores: Vec<f32>| {
+        scores.iter().filter(|s| **s > 1.0).count() as f32 / scores.len().max(1) as f32
+    };
+    let known = Dataset::generate(&extractor, test_size, (0.2, 1.0), 99)?;
+    let unseen =
+        Dataset::generate_condition(&extractor, Condition::Cavitation, test_size, (0.3, 1.0), 5)?;
+    let mut called = [0usize; Condition::ALL.len()];
+    for p in diag.classify_features(&unseen.features)?.argmax_last() {
+        called[p] += 1;
     }
     let calls: Vec<String> = Condition::ALL
         .iter()
@@ -201,17 +169,13 @@ fn train(npu: &Npu, out: &Path, per_class: usize, epochs: usize) -> Result<()> {
         .map(|(c, n)| format!("{c} {n}"))
         .collect();
     println!(
-        "\nnovelty (score > 1): {:.1}% of known-condition windows, {:.1}% of cavitation windows \
+        "novelty (score > 1): {:.1}% of known-condition windows, {:.1}% of cavitation windows \
          (a fault the classifier never saw; it called them: {})",
-        100.0 * known_flagged,
-        100.0 * flagged(&novelty),
+        100.0 * flagged(diag.novelty_scores(&known.features)?),
+        100.0 * flagged(diag.novelty_scores(&unseen.features)?),
         calls.join(", ")
     );
     Ok(())
-}
-
-fn flagged(scores: &[f32]) -> f32 {
-    scores.iter().filter(|s| **s > 1.0).count() as f32 / scores.len().max(1) as f32
 }
 
 fn clock(hour: usize) -> String {
@@ -229,10 +193,8 @@ fn monitor(pool: &NpuPool, path: &Path, machines: usize, hours: usize, seed: u64
     if !diagnoser.copies()[0].has_novelty() {
         println!("note: model has no novelty detector (retrain to get one)");
     }
-    let assets = fleet::plant(machines, hours, seed);
-    let mut trackers = vec![AlarmTracker::default(); machines];
-    let mut first_alarm: Vec<Option<(usize, Diagnosis)>> = vec![None; machines];
-    let mut final_call: Vec<Option<Diagnosis>> = vec![None; machines];
+    let plant = Plant::simulate(machines, hours, seed);
+    let mut monitor = Monitor::new(machines);
     let mut npu_time = Duration::ZERO;
     let mut worst_check = 0.0f64;
 
@@ -242,58 +204,45 @@ fn monitor(pool: &NpuPool, path: &Path, machines: usize, hours: usize, seed: u64
     );
     for hour in 0..hours {
         // Daily NPU self-test: random vectors through each NPU's resident
-        // novelty projector, verified on the CPU with compute::check_product.
+        // novelty matrix, verified on the CPU with Matrix::product_error.
         if hour % 24 == 0 {
             for (n, copy) in diagnoser.copies().iter().enumerate() {
-                if let Some(err) = copy.self_check(hour as u64)? {
-                    worst_check = worst_check.max(err);
-                    if err > 0.05 {
-                        println!(
-                            "{}  NPU {n} self-check error {:.1}%: recalibrate",
-                            clock(hour),
-                            100.0 * err
-                        );
-                    }
+                let Some(err) = copy.self_check(hour as u64)? else {
+                    continue;
+                };
+                worst_check = worst_check.max(err);
+                if err > 0.05 {
+                    println!(
+                        "{}  NPU {n} self-check error {:.1}%: recalibrate",
+                        clock(hour),
+                        100.0 * err
+                    );
                 }
             }
         }
-        let mut batch = Vec::with_capacity(machines * INPUT_WIDTH);
-        for a in &assets {
-            batch.push(a.machine.shaft_hz);
-            batch.extend(a.measure(hour, seed));
-        }
-        let x = Tensor::from_f32(&batch, [machines, INPUT_WIDTH])?;
+        let rows: Vec<Vec<f32>> = plant
+            .measure(hour)
+            .into_iter()
+            .map(|m| std::iter::once(m.shaft_hz).chain(m.samples).collect())
+            .collect();
         let t = Instant::now();
-        let out = diagnoser.forward(&x)?.to_f32_vec();
+        let out =
+            Matrix::from_tensor(&diagnoser.forward(&Matrix::from_rows(&rows)?.to_tensor()?)?)?;
         npu_time += t.elapsed();
-        for (i, row) in out.chunks(OUTPUT_WIDTH).enumerate() {
-            let event = trackers[i].update(&Assessment::from_row(row));
-            let a = &assets[i];
-            let (kind, diagnosis, confidence) = match event {
-                Event::Alarm {
-                    diagnosis,
-                    confidence,
-                } => {
-                    first_alarm[i] = Some((hour, diagnosis));
-                    ("ALARM ", diagnosis, confidence)
-                }
-                Event::Reclassified {
-                    diagnosis,
-                    confidence,
-                } => ("UPDATE", diagnosis, confidence),
-                Event::None => continue,
-            };
-            final_call[i] = Some(diagnosis);
-            let strength = match diagnosis {
-                Diagnosis::Unrecognised => format!("novelty {confidence:.1}"),
-                Diagnosis::Fault(_) => format!("{:.0}%", 100.0 * confidence),
+        let assessments: Vec<Assessment> = out.iter_rows().map(Assessment::from_row).collect();
+        debug_assert_eq!(out.cols(), OUTPUT_WIDTH);
+        for n in monitor.step(hour, &assessments) {
+            let strength = match n.diagnosis {
+                Diagnosis::Unrecognised => format!("novelty {:.1}", n.confidence),
+                Diagnosis::Fault(_) => format!("{:.0}%", 100.0 * n.confidence),
             };
             println!(
-                "{}  {kind}  {:<14} {:<13} {strength:<12} -> {}",
+                "{}  {}  {:<14} {:<13} {strength:<12} -> {}",
                 clock(hour),
-                a.name,
-                diagnosis.to_string(),
-                diagnosis.action()
+                if n.new_alarm { "ALARM " } else { "UPDATE" },
+                plant.assets[n.asset].name,
+                n.diagnosis.to_string(),
+                n.diagnosis.action()
             );
         }
     }
@@ -302,68 +251,41 @@ fn monitor(pool: &NpuPool, path: &Path, machines: usize, hours: usize, seed: u64
         "\n{:<14} {:<32} {:<32} {:>9} {:>7}  result",
         "machine", "truth", "first alarm", "severity", "health"
     );
-    let (mut hits, mut wrong, mut missed, mut false_alarms, mut faults) = (0, 0, 0, 0, 0);
-    for (i, a) in assets.iter().enumerate() {
-        let truth = match a.degradation {
-            Some(d) => format!("{} from {}", d.condition, clock(d.onset_hour)),
-            None => "healthy".into(),
-        };
-        let alarm = first_alarm[i]
-            .map(|(h, d)| format!("{d} at {}", clock(h)))
-            .unwrap_or_else(|| "-".into());
-        let (severity, result) = match (a.degradation, first_alarm[i]) {
-            (Some(d), Some((h, _))) => {
-                faults += 1;
-                let expected = match d.condition.class() {
-                    Some(_) => Diagnosis::Fault(d.condition),
-                    None => Diagnosis::Unrecognised,
-                };
-                let ok = final_call[i] == Some(expected);
-                if ok {
-                    hits += 1
-                } else {
-                    wrong += 1
-                }
-                let result = match (ok, expected) {
-                    (true, Diagnosis::Unrecognised) => "detected (new fault type)",
-                    (true, _) => "detected",
-                    (false, _) => "detected, wrong diagnosis",
-                };
-                (format!("{:.0}%", 100.0 * a.state_at(h).1), result)
-            }
-            (Some(_), None) => {
-                faults += 1;
-                let reached = a.state_at(hours - 1).1;
-                if reached > 0.3 {
-                    missed += 1
-                }
-                (
-                    "-".into(),
-                    if reached > 0.3 {
-                        "MISSED"
-                    } else {
-                        "not developed yet"
-                    },
-                )
-            }
-            (None, Some(_)) => {
-                false_alarms += 1;
-                ("-".into(), "FALSE ALARM")
-            }
-            (None, None) => ("-".into(), "ok"),
-        };
+    let outcomes: Vec<_> = (0..machines).map(|i| monitor.outcome(&plant, i)).collect();
+    for (i, (asset, outcome)) in plant.assets.iter().zip(&outcomes).enumerate() {
+        let truth = asset.degradation.map_or("healthy".into(), |d| {
+            format!("{} from {}", d.condition, clock(d.onset_hour))
+        });
+        let alarm = monitor
+            .first_alarm(i)
+            .map_or("-".into(), |(h, d)| format!("{d} at {}", clock(h)));
+        let severity = outcome
+            .severity()
+            .map_or("-".into(), |s| format!("{:.0}%", 100.0 * s));
         println!(
-            "{:<14} {truth:<32} {alarm:<32} {severity:>9} {:>6.0}%  {result}",
-            a.name,
-            100.0 * trackers[i].health()
+            "{:<14} {truth:<32} {alarm:<32} {severity:>9} {:>6.0}%  {}",
+            asset.name,
+            100.0 * monitor.health(i),
+            outcome.label()
         );
     }
+    use machine_monitor::fleet::Outcome::*;
+    let count =
+        |f: fn(&machine_monitor::fleet::Outcome) -> bool| outcomes.iter().filter(|o| f(o)).count();
     println!(
         "\n'severity' is how far the fault had developed when the alarm fired (lower = earlier warning)."
     );
     println!(
-        "{hits}/{faults} faults found with the right diagnosis, {wrong} with the wrong one, \
-         {missed} missed, {false_alarms} false alarm(s)"
+        "{}/{} faults found with the right diagnosis, {} with the wrong one, {} missed, {} false alarm(s)",
+        count(|o| matches!(o, Detected { .. })),
+        plant
+            .assets
+            .iter()
+            .filter(|a| a.degradation.is_some())
+            .count(),
+        count(|o| matches!(o, WrongDiagnosis { .. })),
+        count(|o| matches!(o, Missed)),
+        count(|o| matches!(o, FalseAlarm)),
     );
 
     let windows = machines * hours;
@@ -420,12 +342,10 @@ async fn serve(pool: NpuPool, path: PathBuf, addr: String) -> Result<()> {
 }
 
 fn sample(condition: Condition, severity: f32, rpm: f32, seed: u64) -> Result<()> {
-    let machine = Machine::random_at(rpm / 60.0, seed);
-    let mut data = vec![machine.shaft_hz];
-    data.extend(machine.measure(condition, severity, seed + 1));
-    let rounded: Vec<f64> = data
-        .iter()
-        .map(|v| (*v as f64 * 1e5).round() / 1e5)
+    let m = Machine::random_at(rpm / 60.0, seed).measure(condition, severity, seed + 1);
+    let rounded: Vec<f64> = std::iter::once(m.shaft_hz)
+        .chain(m.samples)
+        .map(|v| (v as f64 * 1e5).round() / 1e5)
         .collect();
     println!(
         "{}",

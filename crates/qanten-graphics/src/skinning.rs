@@ -14,34 +14,38 @@
 //!   uploaded once and resident on the NPU;
 //! - per character, the three rows of every `(M_b − I)` (`3 × 4·bones`).
 //!
+//! Memory on the NPU: `vertices × 4·bones` (plus `vertices × 3·bones` with
+//! normals) bf16 values, e.g. 20k vertices × 64 bones ≈ 10 MB. The matrices
+//! are built only when the mesh is accelerated.
+//!
 //! Crowds sharing one mesh go through in a single call. Computing offsets
 //! instead of positions keeps the bf16 error proportional to how far the
 //! mesh moved, not how large it is.
 
 use glam::{Mat4, Vec3};
+use qanten::compute::Matrix;
 use rayon::prelude::*;
 
-use crate::accel::{ResidentMatrix, Target, worst_check};
-use qanten::pool::NpuPool;
-
-use crate::{Error, Npu, Result};
+use crate::accel::{Accelerated, MatrixOp, accelerated_methods};
+use crate::{Error, Result};
 
 /// Up to four bone influences per vertex (unused slots have weight 0).
 pub type Influences = [(u16, f32); 4];
 
-/// Skinned positions (and normals, if the mesh has them) of one or more characters.
+/// Skinned positions (and normals, if the mesh has them) of one character.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Skinned {
-    /// Skinned positions, `characters × vertices`.
+    /// Skinned positions, one per vertex.
     pub positions: Vec<Vec3>,
     /// Skinned unit normals (empty if the mesh has none).
     pub normals: Vec<Vec3>,
 }
 
+/// The NPU formulation: `A` for positions and, with normals, `N[v, (b, j)] = w_vb · n_j`.
 #[derive(Debug)]
-struct NpuSkin {
-    positions: ResidentMatrix,
-    normals: Option<ResidentMatrix>,
+struct SkinMatrices {
+    positions: MatrixOp,
+    normals: Option<MatrixOp>,
 }
 
 /// A mesh bound to a skeleton.
@@ -51,10 +55,41 @@ pub struct SkinnedMesh {
     rest_normals: Option<Vec<Vec3>>,
     influences: Vec<Influences>,
     bones: usize,
-    npu: Option<NpuSkin>,
+    matrices: Option<SkinMatrices>,
 }
 
+impl Accelerated for SkinnedMesh {
+    fn ops(&self) -> Vec<&MatrixOp> {
+        self.matrices
+            .iter()
+            .flat_map(|m| std::iter::once(&m.positions).chain(&m.normals))
+            .collect()
+    }
+
+    fn ops_mut(&mut self) -> Vec<&mut MatrixOp> {
+        self.matrices
+            .iter_mut()
+            .flat_map(|m| std::iter::once(&mut m.positions).chain(&mut m.normals))
+            .collect()
+    }
+
+    fn prepare(&mut self) {
+        let positions = self.weighted(4, |v, j| self.rest[v].extend(1.0)[j]);
+        let normals = self
+            .rest_normals
+            .as_ref()
+            .map(|ns| self.weighted(3, |v, j| ns[v][j]));
+        self.matrices = Some(SkinMatrices {
+            positions: MatrixOp::new(positions),
+            normals: normals.map(MatrixOp::new),
+        });
+    }
+}
+
+accelerated_methods!(SkinnedMesh);
+
 impl SkinnedMesh {
+    /// `influences[v]` lists `(bone, weight)` pairs for vertex `v`.
     /// Weights are renormalised to sum to 1 per vertex.
     pub fn new(
         rest: Vec<Vec3>,
@@ -88,63 +123,21 @@ impl SkinnedMesh {
             rest_normals,
             influences,
             bones,
-            npu: None,
+            matrices: None,
         })
     }
 
-    /// Uploads the constant skinning matrices to `npu`.
-    ///
-    /// Memory: `vertices × 4·bones` (plus `vertices × 3·bones` with normals)
-    /// bf16 values, e.g. 20k vertices × 64 bones ≈ 10 MB.
-    pub fn with_npu(self, npu: &Npu) -> Result<Self> {
-        self.upload_to(Target::Npu(npu))
-    }
-
-    /// Like [`with_npu`](Self::with_npu), but with a full copy on every NPU of
-    /// `pool`; each batch is split between them, so they all work at once.
-    pub fn with_pool(self, pool: &NpuPool) -> Result<Self> {
-        self.upload_to(Target::Pool(pool))
-    }
-
-    /// NPU self-test: relative error of the resident matrices on random
-    /// vectors, checked on the CPU with
-    /// [`qanten::compute::check_product`]. `None` on the CPU path. Run it now
-    /// and then on hardware: a rising value means the NPU needs recalibration.
-    pub fn self_check(&self) -> Result<Option<f64>> {
-        self.npu
-            .as_ref()
-            .map(|s| worst_check(std::iter::once(&s.positions).chain(s.normals.as_ref()), 1))
-            .transpose()
-    }
-
-    fn upload_to(mut self, target: Target<'_>) -> Result<Self> {
-        let (v, b) = (self.rest.len(), self.bones);
-        let mut a = vec![0.0f32; v * 4 * b];
-        for (vi, (p, inf)) in self.rest.iter().zip(&self.influences).enumerate() {
-            let h = [p.x, p.y, p.z, 1.0];
+    /// `M[v, (b, j)] = Σ w_vb · value(v, j)` for `j < width` (`vertices × width·bones`).
+    fn weighted(&self, width: usize, value: impl Fn(usize, usize) -> f32) -> Matrix {
+        let mut m = Matrix::zeros(self.rest.len(), width * self.bones);
+        for (v, inf) in self.influences.iter().enumerate() {
             for &(bone, w) in inf {
-                for j in 0..4 {
-                    a[vi * 4 * b + bone as usize * 4 + j] += w * h[j];
+                for j in 0..width {
+                    m[(v, bone as usize * width + j)] += w * value(v, j);
                 }
             }
         }
-        let positions = ResidentMatrix::upload(target, &a, v, 4 * b)?;
-        let normals = match &self.rest_normals {
-            Some(ns) => {
-                let mut m = vec![0.0f32; v * 3 * b];
-                for (vi, (n, inf)) in ns.iter().zip(&self.influences).enumerate() {
-                    for &(bone, w) in inf {
-                        for j in 0..3 {
-                            m[vi * 3 * b + bone as usize * 3 + j] += w * n[j];
-                        }
-                    }
-                }
-                Some(ResidentMatrix::upload(target, &m, v, 3 * b)?)
-            }
-            None => None,
-        };
-        self.npu = Some(NpuSkin { positions, normals });
-        Ok(self)
+        m
     }
 
     /// Vertices in the mesh.
@@ -160,111 +153,97 @@ impl SkinnedMesh {
     /// Skins one character. `bones[b]` is the skinning matrix of bone `b`
     /// (animated world transform × inverse bind matrix).
     pub fn skin(&self, bones: &[Mat4]) -> Result<Skinned> {
-        self.skin_batch(bones)
+        Ok(self.skin_batch(&[bones])?.remove(0))
     }
 
-    /// Skins `characters` poses in one call. `poses` is `characters × bones`
-    /// matrices; the result holds `characters × vertices` entries.
-    pub fn skin_batch(&self, poses: &[Mat4]) -> Result<Skinned> {
-        let chars = self.check(poses)?;
-        let Some(npu) = &self.npu else {
+    /// Skins many characters in one call: `poses[c]` holds character `c`'s
+    /// bone matrices.
+    pub fn skin_batch<P: AsRef<[Mat4]> + Sync>(&self, poses: &[P]) -> Result<Vec<Skinned>> {
+        self.check(poses)?;
+        let Some(m) = &self.matrices else {
             return Ok(self.skin_batch_cpu(poses));
         };
-        let b = self.bones;
-        let v = self.rest.len();
-        // Rows (char, i): entries (bone, j) = (M_b - I)[i][j].
-        let mut delta_rows = vec![0.0f32; chars * 3 * 4 * b];
-        for (c, pose) in poses.chunks(b).enumerate() {
-            for (bi, m) in pose.iter().enumerate() {
-                for i in 0..3 {
-                    for j in 0..4 {
-                        let ident = if i == j { 1.0 } else { 0.0 };
-                        delta_rows[(c * 3 + i) * 4 * b + bi * 4 + j] = m.col(j)[i] - ident;
-                    }
-                }
-            }
-        }
-        let offsets = npu.positions.apply(&delta_rows, chars * 3)?; // [chars*3, V]
-        let positions: Vec<Vec3> = (0..chars * v)
-            .into_par_iter()
-            .map(|k| {
-                let (c, vi) = (k / v, k % v);
-                let o = |i: usize| offsets[(c * 3 + i) * v + vi];
-                self.rest[vi] + Vec3::new(o(0), o(1), o(2))
-            })
-            .collect();
-
-        let normals = match &npu.normals {
-            Some(nm) => {
-                let mut rot_rows = vec![0.0f32; chars * 3 * 3 * b];
-                for (c, pose) in poses.chunks(b).enumerate() {
-                    for (bi, m) in pose.iter().enumerate() {
-                        for i in 0..3 {
-                            for j in 0..3 {
-                                rot_rows[(c * 3 + i) * 3 * b + bi * 3 + j] = m.col(j)[i];
-                            }
-                        }
-                    }
-                }
-                let out = nm.apply(&rot_rows, chars * 3)?;
-                (0..chars * v)
-                    .into_par_iter()
-                    .map(|k| {
-                        let (c, vi) = (k / v, k % v);
-                        let o = |i: usize| out[(c * 3 + i) * v + vi];
-                        Vec3::new(o(0), o(1), o(2)).normalize_or(Vec3::Y)
-                    })
-                    .collect()
-            }
-            None => Vec::new(),
+        // Per character, rows i = 0..3 with entries (bone, j) = (M_b − I)[i][j].
+        let delta = self.pose_rows(poses, 4, |pose, i, j| {
+            pose.col(j)[i] - if i == j { 1.0 } else { 0.0 }
+        });
+        let offsets = m.positions.apply(&delta)?; // [3·characters, V]
+        let normals = match &m.normals {
+            Some(n) => Some(n.apply(&self.pose_rows(poses, 3, |pose, i, j| pose.col(j)[i]))?),
+            None => None,
         };
-        Ok(Skinned { positions, normals })
+        Ok((0..poses.len())
+            .map(|c| Skinned {
+                positions: Self::columns_as_vec3(&offsets, c)
+                    .zip(&self.rest)
+                    .map(|(o, r)| *r + o)
+                    .collect(),
+                normals: normals.as_ref().map_or_else(Vec::new, |n| {
+                    Self::columns_as_vec3(n, c)
+                        .map(|v| v.normalize_or(Vec3::Y))
+                        .collect()
+                }),
+            })
+            .collect())
+    }
+
+    /// `3·characters × width·bones` rows: `entry(M_b, i, j)` for each character.
+    fn pose_rows<P: AsRef<[Mat4]>>(
+        &self,
+        poses: &[P],
+        width: usize,
+        entry: impl Fn(&Mat4, usize, usize) -> f32,
+    ) -> Matrix {
+        Matrix::from_fn(3 * poses.len(), width * self.bones, |r, col| {
+            entry(&poses[r / 3].as_ref()[col / width], r % 3, col % width)
+        })
+    }
+
+    /// Character `c`'s three rows of a `[3·characters, V]` result, as one Vec3 per vertex.
+    fn columns_as_vec3(m: &Matrix, c: usize) -> impl Iterator<Item = Vec3> + '_ {
+        let (x, y, z) = (m.row(3 * c), m.row(3 * c + 1), m.row(3 * c + 2));
+        x.iter()
+            .zip(y)
+            .zip(z)
+            .map(|((x, y), z)| Vec3::new(*x, *y, *z))
     }
 
     /// Standard CPU linear blend skinning (reference / fallback).
-    pub fn skin_batch_cpu(&self, poses: &[Mat4]) -> Skinned {
-        let b = self.bones.max(1);
-        let v = self.rest.len();
-        let chars = poses.len() / b;
-        let positions = (0..chars * v)
-            .into_par_iter()
-            .map(|k| {
-                let (c, vi) = (k / v, k % v);
-                let pose = &poses[c * b..(c + 1) * b];
-                self.influences[vi]
-                    .iter()
-                    .filter(|(_, w)| *w != 0.0)
-                    .map(|&(bone, w)| w * pose[bone as usize].transform_point3(self.rest[vi]))
-                    .sum()
-            })
-            .collect();
-        let normals = match &self.rest_normals {
-            Some(ns) => (0..chars * v)
-                .into_par_iter()
-                .map(|k| {
-                    let (c, vi) = (k / v, k % v);
-                    let pose = &poses[c * b..(c + 1) * b];
-                    self.influences[vi]
+    pub fn skin_batch_cpu<P: AsRef<[Mat4]> + Sync>(&self, poses: &[P]) -> Vec<Skinned> {
+        poses
+            .par_iter()
+            .map(|pose| {
+                let pose = pose.as_ref();
+                let blend = |v: usize, f: &dyn Fn(&Mat4) -> Vec3| -> Vec3 {
+                    self.influences[v]
                         .iter()
                         .filter(|(_, w)| *w != 0.0)
-                        .map(|&(bone, w)| w * pose[bone as usize].transform_vector3(ns[vi]))
-                        .sum::<Vec3>()
-                        .normalize_or(Vec3::Y)
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-        Skinned { positions, normals }
+                        .map(|&(bone, w)| w * f(&pose[bone as usize]))
+                        .sum()
+                };
+                Skinned {
+                    positions: (0..self.rest.len())
+                        .map(|v| blend(v, &|m| m.transform_point3(self.rest[v])))
+                        .collect(),
+                    normals: self.rest_normals.as_ref().map_or_else(Vec::new, |ns| {
+                        (0..ns.len())
+                            .map(|v| {
+                                blend(v, &|m| m.transform_vector3(ns[v])).normalize_or(Vec3::Y)
+                            })
+                            .collect()
+                    }),
+                }
+            })
+            .collect()
     }
 
-    fn check(&self, poses: &[Mat4]) -> Result<usize> {
-        if self.bones == 0 || !poses.len().is_multiple_of(self.bones) {
+    fn check<P: AsRef<[Mat4]>>(&self, poses: &[P]) -> Result<()> {
+        if poses.is_empty() || poses.iter().any(|p| p.as_ref().len() != self.bones) {
             return Err(Error::Shape(format!(
-                "{} matrices is not a multiple of {} bones",
-                poses.len(),
+                "every pose needs one matrix per bone ({})",
                 self.bones
             )));
         }
-        Ok(poses.len() / self.bones)
+        Ok(())
     }
 }

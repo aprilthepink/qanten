@@ -13,5 +13,5 @@ QANTEN_DRIVER_LIB="$PWD/target/debug/libqant_native_computing_driver.so" cargo t
 cargo bench -q --workspace --all-features --no-run
 RUSTDOCFLAGS="-D warnings" cargo doc -q --workspace --all-features --no-deps
 if rustup toolchain list | grep -q '^1.88'; then cargo +1.88 check -q --workspace --all-features --all-targets; fi
-python3 scripts/check_docs.py > /dev/null
+python3 scripts/check_docs.py --quiet
 echo "ci.sh: all checks passed"

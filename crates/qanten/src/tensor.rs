@@ -214,6 +214,18 @@ impl Tensor {
         }
     }
 
+    /// Smallest and largest value (`None` for an empty tensor).
+    pub fn min_max(&self) -> Option<(f32, f32)> {
+        self.data.iter().map(|v| v.to_f32()).fold(None, |acc, x| {
+            Some(acc.map_or((x, x), |(lo, hi): (f32, f32)| (lo.min(x), hi.max(x))))
+        })
+    }
+
+    /// Mean of all values (`0` for an empty tensor).
+    pub fn mean(&self) -> f32 {
+        self.data.iter().map(|v| v.to_f32()).sum::<f32>() / self.len().max(1) as f32
+    }
+
     /// Index of the maximum along the last dimension, for every row.
     pub fn argmax_last(&self) -> Vec<usize> {
         let Some(&last) = self.shape.last() else {

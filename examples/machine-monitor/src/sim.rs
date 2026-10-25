@@ -19,6 +19,8 @@ use std::f32::consts::TAU;
 use std::fmt;
 use std::str::FromStr;
 
+use qanten::rng::SplitMix64;
+
 /// Accelerometer sample rate in Hz.
 pub const SAMPLE_RATE: f32 = 10_240.0;
 /// Samples per measurement window (0.4 s).
@@ -125,42 +127,13 @@ impl FromStr for Condition {
     }
 }
 
-/// Small deterministic RNG (SplitMix64) with uniform and Gaussian draws.
-#[derive(Debug, Clone)]
-pub struct Rng(u64);
-
-impl Rng {
-    /// Seeded generator.
-    pub fn new(seed: u64) -> Self {
-        Self(seed ^ 0x5DEE_CE66_D1CE_4E5B)
-    }
-
-    /// Next raw 64-bit value.
-    pub fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Uniform in `[lo, hi)`.
-    pub fn uniform(&mut self, lo: f32, hi: f32) -> f32 {
-        let u = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32;
-        lo + (hi - lo) * u
-    }
-
-    /// Standard normal (Box–Muller).
-    pub fn gaussian(&mut self) -> f32 {
-        let u1 = self.uniform(1e-7, 1.0);
-        let u2 = self.uniform(0.0, 1.0);
-        (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos()
-    }
-
-    /// Uniform index below `n`.
-    pub fn below(&mut self, n: usize) -> usize {
-        (self.next_u64() % n.max(1) as u64) as usize
-    }
+/// One accelerometer window and the shaft speed it was taken at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Measurement {
+    /// Shaft speed in Hz (from a tachometer or the drive).
+    pub shaft_hz: f32,
+    /// [`WINDOW`] acceleration samples in g at [`SAMPLE_RATE`].
+    pub samples: Vec<f32>,
 }
 
 /// One machine: its running speed and the parts of its vibration that don't
@@ -181,13 +154,13 @@ pub struct Machine {
 impl Machine {
     /// A random machine running between 15 and 45 Hz (900–2700 rpm).
     pub fn random(seed: u64) -> Self {
-        let mut r = Rng::new(seed);
+        let mut r = SplitMix64::new(seed ^ 0x5DEE_CE66_D1CE_4E5B);
         Self::random_at(r.uniform(15.0, 45.0), seed)
     }
 
     /// A random machine at a given shaft speed.
     pub fn random_at(shaft_hz: f32, seed: u64) -> Self {
-        let mut r = Rng::new(seed.wrapping_mul(31).wrapping_add(7));
+        let mut r = SplitMix64::new(seed.wrapping_mul(31).wrapping_add(7));
         Self {
             shaft_hz,
             base_1x: r.uniform(0.02, 0.06),
@@ -202,13 +175,20 @@ impl Machine {
 
     /// One [`WINDOW`]-sample acceleration measurement (in g) with `condition`
     /// at `severity` (0 = just starting, 1 = severe).
-    pub fn measure(&self, condition: Condition, severity: f32, seed: u64) -> Vec<f32> {
-        let mut r = Rng::new(seed);
+    pub fn measure(&self, condition: Condition, severity: f32, seed: u64) -> Measurement {
+        Measurement {
+            shaft_hz: self.shaft_hz,
+            samples: self.vibration(condition, severity, seed),
+        }
+    }
+
+    fn vibration(&self, condition: Condition, severity: f32, seed: u64) -> Vec<f32> {
+        let mut r = SplitMix64::new(seed);
         let f = self.shaft_hz;
         let s = severity.clamp(0.0, 1.0) * self.fault_gain;
         let dt = 1.0 / SAMPLE_RATE;
         let t0 = r.uniform(0.0, 100.0);
-        let phase = |r: &mut Rng| r.uniform(0.0, TAU);
+        let phase = |r: &mut SplitMix64| r.uniform(0.0, TAU);
 
         // Periodic part: (order, amplitude, phase).
         let p1 = phase(&mut r);
@@ -239,7 +219,7 @@ impl Machine {
                 for &(order, amp, ph) in &tones {
                     v += amp * (TAU * order * f * (t - t0) + ph).sin();
                 }
-                v + self.noise * r.gaussian()
+                v + self.noise * r.next_normal()
             })
             .collect();
 
@@ -261,7 +241,7 @@ impl Machine {
                     0.6 + 0.4 * (TAU * f * t + p1).cos()
                 } else {
                     1.0
-                } * (1.0 + 0.2 * r.gaussian());
+                } * (1.0 + 0.2 * r.next_normal());
                 let start = (t / dt) as usize;
                 for k in 0..ring.min(WINDOW.saturating_sub(start)) {
                     let tt = k as f32 * dt;
@@ -269,7 +249,7 @@ impl Machine {
                         amp * gain * (-tt / tau).exp() * (TAU * self.resonance_hz * tt).sin();
                 }
                 // Rolling elements slip a little, so impacts aren't perfectly periodic.
-                t += period * (1.0 + 0.01 * r.gaussian());
+                t += period * (1.0 + 0.01 * r.next_normal());
             }
         }
         if condition == Condition::Cavitation {
@@ -295,7 +275,8 @@ impl Machine {
                 }
             }
             let turbulence = s * 0.02;
-            x.iter_mut().for_each(|v| *v += turbulence * r.gaussian());
+            x.iter_mut()
+                .for_each(|v| *v += turbulence * r.next_normal());
         }
         x
     }

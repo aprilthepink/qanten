@@ -10,9 +10,10 @@ mod common;
 use std::f32::consts::TAU;
 use std::time::Instant;
 
-use common::{Canvas, max_err, ms, view_proj};
+use common::{Canvas, max_err, max_err_all, ms, view_proj};
 use glam::{Mat4, Quat, Vec3};
 use qanten::Npu;
+use qanten::compute::Matrix;
 use qanten_graphics::blendshapes::Blendshapes;
 use qanten_graphics::skinning::{Influences, SkinnedMesh};
 
@@ -83,7 +84,7 @@ fn main() -> anyhow::Result<()> {
     let (rest, normals, influences, tris) = tentacle();
     let grid = 10;
     let chars = grid * grid;
-    let poses: Vec<Mat4> = (0..chars).flat_map(|c| pose(c, 2.0)).collect();
+    let poses: Vec<Vec<Mat4>> = (0..chars).map(|c| pose(c, 2.0)).collect();
     let mesh = SkinnedMesh::new(
         rest.clone(),
         Some(normals.clone()),
@@ -102,10 +103,17 @@ fn main() -> anyhow::Result<()> {
         rest.len()
     );
     println!("  CPU LBS:  {cpu_ms:7.1} ms   NPU path: {npu_ms:7.1} ms (1 call)");
+    let worst = |f: fn(&qanten_graphics::skinning::Skinned) -> &Vec<Vec3>| {
+        skinned
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| max_err(f(a), f(b)))
+            .fold(0.0, f32::max)
+    };
     println!(
         "  max error: position {:.4} m on a {HEIGHT} m mesh, normal {:.4}",
-        max_err(&skinned.positions, &want.positions),
-        max_err(&skinned.normals, &want.normals)
+        worst(|s| &s.positions),
+        worst(|s| &s.normals)
     );
 
     // --- Blendshapes: 200 faces × 52 shapes ---
@@ -121,12 +129,12 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
     let faces = 200;
-    let weights: Vec<f32> = (0..faces * 52)
-        .map(|k| 0.5 + 0.5 * (k as f32 * 0.37).sin())
-        .collect();
+    let weights = Matrix::from_fn(faces, 52, |f, s| {
+        0.5 + 0.5 * ((f * 52 + s) as f32 * 0.37).sin()
+    });
     let bs = Blendshapes::new(base, &deltas)?;
     let t0 = Instant::now();
-    let bw = bs.evaluate_batch_cpu(&weights);
+    let bw = bs.evaluate_batch_cpu(&weights)?;
     let cpu_ms = ms(t0.elapsed());
     let bs = bs.with_npu(&npu)?;
     let t0 = Instant::now();
@@ -135,7 +143,7 @@ fn main() -> anyhow::Result<()> {
     println!("blendshapes: {faces} faces × {face_v} vertices × 52 shapes");
     println!(
         "  CPU:      {cpu_ms:7.1} ms   NPU path: {npu_ms:7.1} ms (1 call), max error {:.5} m",
-        max_err(&bn, &bw)
+        max_err_all(&bn, &bw)
     );
 
     // --- Render the crowd ---
@@ -172,8 +180,7 @@ fn main() -> anyhow::Result<()> {
             canvas.triangle(&vp, [q[1], q[3], q[2]], [c; 3]);
         }
     }
-    let v = rest.len();
-    for c in 0..chars {
+    for (c, character) in skinned.iter().enumerate() {
         let offset = Vec3::new((c % grid) as f32 * 2.0, 0.0, (c / grid) as f32 * 2.0);
         let hue = c as f32 / chars as f32 * TAU;
         let albedo = Vec3::new(
@@ -181,8 +188,7 @@ fn main() -> anyhow::Result<()> {
             0.35 + 0.25 * (hue + 2.1).cos(),
             0.55 + 0.35 * (hue + 4.2).cos(),
         );
-        let pos = &skinned.positions[c * v..(c + 1) * v];
-        let nrm = &skinned.normals[c * v..(c + 1) * v];
+        let (pos, nrm) = (&character.positions, &character.normals);
         let shade = |k: usize| {
             let n = nrm[k];
             let rim = (1.0 - n.dot((eye - pos[k] - offset).normalize()).abs()).powi(3);

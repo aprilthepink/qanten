@@ -30,24 +30,15 @@ struct Args {
     /// Milliseconds the batcher waits for more requests.
     #[arg(long, default_value_t = 2)]
     max_wait_ms: u64,
-    /// Activation between layers of MLP weight files.
-    #[arg(long, value_enum, default_value = "relu")]
-    activation: Act,
+    /// Activation between layers of MLP weight files: relu, tanh, sigmoid, gelu or silu.
+    #[arg(long, default_value = "relu")]
+    activation: ActivationKind,
     /// Use simulated NPUs instead of hardware.
     #[arg(long, env = "QANTEN_SIM")]
     sim: bool,
     /// Number of simulated NPUs (with --sim).
     #[arg(long, default_value_t = 1)]
     sim_npus: u32,
-}
-
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum Act {
-    Relu,
-    Tanh,
-    Sigmoid,
-    Gelu,
-    Silu,
 }
 
 #[tokio::main]
@@ -74,13 +65,7 @@ async fn main() -> Result<()> {
         max_wait: Duration::from_millis(args.max_wait_ms),
     };
     let mut state = AppState::new(&pool, config)?;
-    let activation = match args.activation {
-        Act::Relu => ActivationKind::Relu,
-        Act::Tanh => ActivationKind::Tanh,
-        Act::Sigmoid => ActivationKind::Sigmoid,
-        Act::Gelu => ActivationKind::Gelu,
-        Act::Silu => ActivationKind::Silu,
-    };
+    let activation = args.activation;
     for spec in &args.models {
         let Some((name, path)) = spec.split_once('=') else {
             bail!("--model expects name=path, got `{spec}`");

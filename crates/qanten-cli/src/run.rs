@@ -4,18 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use qanten::nn::{self, Module, StateDict};
+use qanten::nn::{self, ActivationKind, Module, StateDict};
 use qanten::onnx::{OnnxModel, OnnxValue};
 use qanten::{Npu, Tensor};
-
-/// Activation between layers for `--arch mlp`.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-pub enum Activation {
-    Relu,
-    Tanh,
-    Sigmoid,
-    Gelu,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Arch {
@@ -27,14 +18,6 @@ fn ext(path: &Path) -> String {
     path.extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default()
-}
-
-fn load_state_dict(path: &Path) -> Result<StateDict> {
-    Ok(match ext(path).as_str() {
-        "safetensors" => StateDict::load_safetensors(path)?,
-        "npz" => StateDict::load_npz(path)?,
-        other => bail!("cannot read weights from .{other} files (use .safetensors or .npz)"),
-    })
 }
 
 /// `qanten inspect FILE`
@@ -54,15 +37,12 @@ pub fn inspect(path: &Path, npu: &Npu) -> Result<()> {
         );
         return Ok(());
     }
-    let sd = load_state_dict(path)?;
+    let sd = StateDict::load_file(path)?;
     let total: usize = sd.iter().map(|(_, t)| t.len()).sum();
     println!("{}: {} tensors, {} values", path.display(), sd.len(), total);
     let width = sd.keys().map(str::len).max().unwrap_or(0);
     for (name, t) in sd.iter() {
-        let v = t.to_f32_vec();
-        let (lo, hi) = v
-            .iter()
-            .fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+        let (lo, hi) = t.min_max().unwrap_or_default();
         println!(
             "  {name:<width$}  {:<16} min {lo:>9.4}  max {hi:>9.4}",
             format!("{:?}", t.shape())
@@ -71,18 +51,13 @@ pub fn inspect(path: &Path, npu: &Npu) -> Result<()> {
     Ok(())
 }
 
-fn mlp_from_state_dict(
+/// Builds the MLP and prints its layers; returns it with its input size.
+fn load_mlp(
     npu: &Npu,
     sd: &StateDict,
-    act: Activation,
+    activation: ActivationKind,
 ) -> Result<(nn::Sequential, usize)> {
-    let kind = match act {
-        Activation::Relu => nn::ActivationKind::Relu,
-        Activation::Tanh => nn::ActivationKind::Tanh,
-        Activation::Sigmoid => nn::ActivationKind::Sigmoid,
-        Activation::Gelu => nn::ActivationKind::Gelu,
-    };
-    let (model, info) = nn::mlp_from_state_dict(npu, sd, kind)?;
+    let (model, info) = nn::Sequential::load_mlp(npu, sd, activation)?;
     for (i, l) in info.iter().enumerate() {
         println!(
             "  layer {i}: {} [{}, {}]{}",
@@ -111,11 +86,8 @@ fn parse_inputs(specs: &[String]) -> Result<Vec<(Option<String>, Tensor)>> {
 }
 
 fn describe(name: &str, t: &Tensor) {
-    let v = t.to_f32_vec();
-    let (lo, hi) = v
-        .iter()
-        .fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
-    let mean = v.iter().sum::<f32>() / v.len().max(1) as f32;
+    let (lo, hi) = t.min_max().unwrap_or_default();
+    let mean = t.mean();
     println!(
         "  {name}: shape {:?}, min {lo:.4}, max {hi:.4}, mean {mean:.4}",
         t.shape()
@@ -131,7 +103,7 @@ pub struct RunArgs {
     pub inputs: Vec<String>,
     pub output_dir: Option<PathBuf>,
     pub arch: Option<Arch>,
-    pub activation: Activation,
+    pub activation: ActivationKind,
     pub batch: usize,
     pub iters: usize,
     pub profile: bool,
@@ -208,12 +180,12 @@ pub fn run(base: &Npu, args: RunArgs) -> Result<()> {
             (tensors, per)
         }
         "safetensors" | "npz" => {
-            let sd = load_state_dict(&args.model)?;
+            let sd = StateDict::load_file(&args.model)?;
             let arch = args
                 .arch
                 .context("weight files need an architecture: add --arch mlp")?;
             let Arch::Mlp = arch;
-            let (model, in_features) = mlp_from_state_dict(&npu, &sd, args.activation)?;
+            let (model, in_features) = load_mlp(&npu, &sd, args.activation)?;
             println!(
                 "loaded {}-layer MLP from {}",
                 model.len().div_ceil(2),

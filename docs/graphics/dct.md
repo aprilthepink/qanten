@@ -13,20 +13,21 @@ pipelines run it on the CPU over millions of blocks.
 
 ```rust
 use qanten::Npu;
+use qanten::compute::Matrix;
 use qanten_graphics::dct::Dct8x8;
 
 fn main() -> qanten::Result<()> {
     let npu = Npu::auto(0)?;
     let dct = Dct8x8::new().with_npu(&npu)?;
-    let (w, h) = (64, 32);                         // multiples of 8
-    let plane: Vec<f32> = (0..w * h).map(|k| (k % 255) as f32 - 128.0).collect();
+    // A 32 × 64 plane (height × width, both multiples of 8).
+    let plane = Matrix::from_fn(32, 64, |y, x| ((y * 64 + x) % 255) as f32 - 128.0);
 
-    let mut coeffs = dct.forward(&plane, w, h)?;   // same layout; DC at each block's top-left
-    for c in coeffs.iter_mut() {
+    let mut coeffs = dct.forward(&plane)?;         // same layout; DC at each block's top-left
+    for c in coeffs.as_mut_slice() {
         *c = (*c / 16.0).round() * 16.0;           // crude uniform quantisation
     }
-    let back = dct.inverse(&coeffs, w, h)?;
-    assert_eq!(back.len(), plane.len());
+    let back = dct.inverse(&coeffs)?;
+    assert_eq!(back.shape(), plane.shape());
     Ok(())
 }
 ```
@@ -36,9 +37,9 @@ fn main() -> qanten::Result<()> {
 | Item | Purpose |
 |---|---|
 | `Dct8x8::new()` | builds the orthonormal forward and inverse 64×64 matrices |
-| `.with_npu(&npu)` | uploads both |
-| `forward(&plane, w, h)` | each 8×8 block replaced by its coefficients, same layout |
-| `inverse(&coeffs, w, h)` | back to pixels |
+| `.with_npu(&npu)` / `.with_pool(&pool)` | uploads both |
+| `forward(&plane)` | `Matrix` (height × width) with each 8×8 block replaced by its coefficients |
+| `inverse(&coeffs)` | back to pixels |
 
 Width and height must be multiples of 8 (`Error::Shape` otherwise); pad images first.
 

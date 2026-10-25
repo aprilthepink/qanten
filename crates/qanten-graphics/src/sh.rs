@@ -7,18 +7,17 @@
 //! functions: a `[9, samples]` matrix (basis × solid angle) resident on the
 //! NPU times one row of samples per probe and colour channel. Thousands of
 //! probes go through in one call. Evaluating irradiance for many normals
-//! (per-vertex or per-texel lighting) is the same shape the other way round.
+//! (per-vertex or per-texel lighting, [`IrradianceBaker`]) is the same shape
+//! the other way round.
 
 use std::f32::consts::PI;
 
 use glam::Vec3;
+use qanten::compute::Matrix;
 use rayon::prelude::*;
 
-use crate::accel::{ResidentMatrix, Target};
-use qanten::compute::{self, Matrix, Placement};
-use qanten::pool::NpuPool;
-
-use crate::{Error, Npu, Result};
+use crate::accel::{Accelerated, MatrixOp, accelerated_methods};
+use crate::{Error, Result};
 
 /// Real SH basis `Y_lm(d)` for `l ≤ 2`, `d` a unit vector (y up).
 pub fn basis(d: Vec3) -> [f32; 9] {
@@ -78,14 +77,52 @@ impl Sh9 {
     }
 }
 
+impl Sh9 {
+    /// The coefficients as three rows of 9 (R, G, B).
+    fn channel_rows(&self) -> [[f32; 9]; 3] {
+        std::array::from_fn(|ch| std::array::from_fn(|i| self.coeffs[i][ch]))
+    }
+
+    /// From three rows of 9 coefficients (R, G, B).
+    fn from_channel_rows(r: &[f32], g: &[f32], b: &[f32]) -> Self {
+        Self {
+            coeffs: std::array::from_fn(|i| Vec3::new(r[i], g[i], b[i])),
+        }
+    }
+}
+
+/// Rows (item, channel) of a batch of RGB samples: `3·items × len`.
+fn channel_matrix<S: AsRef<[Vec3]> + Sync>(items: &[S], len: usize) -> Result<Matrix> {
+    // Filled in parallel: for big bakes this buffer is tens of MB.
+    let mut data = vec![0.0f32; 3 * items.len() * len];
+    data.par_chunks_mut(len.max(1))
+        .enumerate()
+        .for_each(|(r, row)| {
+            for (v, s) in row.iter_mut().zip(items[r / 3].as_ref()) {
+                *v = s[r % 3];
+            }
+        });
+    Matrix::new(3 * items.len(), len, data)
+}
+
 /// Projects radiance samples onto SH. Holds the sample directions.
 #[derive(Debug)]
 pub struct ShProjector {
     dirs: Vec<Vec3>,
     /// `[9, N]`: `Y_i(d_n) · dω_n`.
-    weighted: Vec<f32>,
-    npu: Option<ResidentMatrix>,
+    weighted: MatrixOp,
 }
+
+impl Accelerated for ShProjector {
+    fn ops(&self) -> Vec<&MatrixOp> {
+        vec![&self.weighted]
+    }
+    fn ops_mut(&mut self) -> Vec<&mut MatrixOp> {
+        vec![&mut self.weighted]
+    }
+}
+
+accelerated_methods!(ShProjector);
 
 impl ShProjector {
     /// `n` directions spread evenly over the sphere (Fibonacci lattice).
@@ -98,17 +135,9 @@ impl ShProjector {
                 let phi = golden * i as f32;
                 Vec3::new(r * phi.cos(), y, r * phi.sin())
             })
-            .collect::<Vec<_>>();
+            .collect();
         let w = 4.0 * PI / n.max(1) as f32;
-        Self::from_directions(dirs, &vec![w; n]).unwrap_or_else(|_| Self::empty())
-    }
-
-    fn empty() -> Self {
-        Self {
-            dirs: Vec::new(),
-            weighted: Vec::new(),
-            npu: None,
-        }
+        Self::build(dirs, |_| w)
     }
 
     /// Custom directions with their solid angles (e.g. cube-map texels).
@@ -118,47 +147,19 @@ impl ShProjector {
                 "one solid angle per direction required".into(),
             ));
         }
-        let n = dirs.len();
-        let mut weighted = vec![0.0f32; 9 * n];
-        for (k, (d, w)) in dirs.iter().zip(solid_angles).enumerate() {
-            for (i, y) in basis(d.normalize_or(Vec3::Y)).iter().enumerate() {
-                weighted[i * n + k] = y * w;
-            }
-        }
-        Ok(Self {
+        Ok(Self::build(dirs, |k| solid_angles[k]))
+    }
+
+    fn build(dirs: Vec<Vec3>, solid_angle: impl Fn(usize) -> f32) -> Self {
+        let bases: Vec<[f32; 9]> = dirs
+            .iter()
+            .map(|d| basis(d.normalize_or(Vec3::Y)))
+            .collect();
+        let weighted = Matrix::from_fn(9, dirs.len(), |i, k| bases[k][i] * solid_angle(k));
+        Self {
             dirs,
-            weighted,
-            npu: None,
-        })
-    }
-
-    /// Uploads the weighted basis to `npu`; later projections run there.
-    pub fn with_npu(self, npu: &Npu) -> Result<Self> {
-        self.upload_to(Target::Npu(npu))
-    }
-
-    /// Like [`with_npu`](Self::with_npu), but with a full copy on every NPU of
-    /// `pool`; each batch is split between them, so they all work at once.
-    pub fn with_pool(self, pool: &NpuPool) -> Result<Self> {
-        self.upload_to(Target::Pool(pool))
-    }
-
-    /// NPU self-test: relative error of the resident matrices on random
-    /// vectors, checked on the CPU with
-    /// [`qanten::compute::check_product`]. `None` on the CPU path. Run it now
-    /// and then on hardware: a rising value means the NPU needs recalibration.
-    pub fn self_check(&self) -> Result<Option<f64>> {
-        self.npu.as_ref().map(|m| m.self_check(1)).transpose()
-    }
-
-    fn upload_to(mut self, target: Target<'_>) -> Result<Self> {
-        self.npu = Some(ResidentMatrix::upload(
-            target,
-            &self.weighted,
-            9,
-            self.dirs.len(),
-        )?);
-        Ok(self)
+            weighted: MatrixOp::new(weighted),
+        }
     }
 
     /// The sample directions; evaluate your environment at these.
@@ -166,102 +167,114 @@ impl ShProjector {
         &self.dirs
     }
 
-    /// `radiance` is `probes × samples`, row-major, one RGB value per direction.
-    pub fn project_batch(&self, radiance: &[Vec3]) -> Result<Vec<Sh9>> {
+    /// Projects many probes at once: `probes[p][k]` is the radiance probe `p`
+    /// receives from direction `k` (one RGB value per [`directions`](Self::directions)).
+    pub fn project_batch<S: AsRef<[Vec3]> + Sync>(&self, probes: &[S]) -> Result<Vec<Sh9>> {
+        self.project_with(probes, |rows| self.weighted.apply(rows))
+    }
+
+    /// CPU reference / fallback (exact).
+    pub fn project_batch_cpu<S: AsRef<[Vec3]> + Sync>(&self, probes: &[S]) -> Result<Vec<Sh9>> {
+        self.project_with(probes, |rows| self.weighted.apply_cpu(rows))
+    }
+
+    fn project_with<S: AsRef<[Vec3]> + Sync>(
+        &self,
+        probes: &[S],
+        apply: impl Fn(&Matrix) -> Result<Matrix>,
+    ) -> Result<Vec<Sh9>> {
         let n = self.dirs.len();
-        if n == 0 || !radiance.len().is_multiple_of(n) {
+        if n == 0 || probes.iter().any(|p| p.as_ref().len() != n) {
             return Err(Error::Shape(format!(
-                "{} samples is not a multiple of {n} directions",
-                radiance.len()
+                "every probe needs one sample per direction ({n})"
             )));
         }
-        let probes = radiance.len() / n;
-        let Some(m) = &self.npu else {
-            return Ok(self.project_batch_cpu(radiance));
-        };
-        // Rows (probe, channel) of N samples.
-        let mut rows = vec![0.0f32; probes * 3 * n];
-        rows.par_chunks_mut(n).enumerate().for_each(|(r, row)| {
-            let (p, ch) = (r / 3, r % 3);
-            for (k, v) in row.iter_mut().enumerate() {
-                *v = radiance[p * n + k][ch];
-            }
-        });
-        let out = m.apply(&rows, probes * 3)?; // [probes*3, 9]
-        Ok((0..probes)
-            .map(|p| Sh9 {
-                coeffs: std::array::from_fn(|i| {
-                    Vec3::new(
-                        out[(p * 3) * 9 + i],
-                        out[(p * 3 + 1) * 9 + i],
-                        out[(p * 3 + 2) * 9 + i],
-                    )
-                }),
-            })
+        let out = apply(&channel_matrix(probes, n)?)?; // [3·probes, 9]
+        Ok(out
+            .as_slice()
+            .chunks_exact(27)
+            .map(|c| Sh9::from_channel_rows(&c[..9], &c[9..18], &c[18..]))
             .collect())
     }
 
     /// Projects one environment given as a function of direction.
     pub fn project_fn(&self, env: impl Fn(Vec3) -> Vec3) -> Result<Sh9> {
         let samples: Vec<Vec3> = self.dirs.iter().map(|&d| env(d)).collect();
-        self.project_batch(&samples)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Shape("projector has no directions".into()))
-    }
-
-    /// CPU reference / fallback.
-    pub fn project_batch_cpu(&self, radiance: &[Vec3]) -> Vec<Sh9> {
-        let n = self.dirs.len().max(1);
-        radiance
-            .par_chunks(n)
-            .map(|samples| Sh9 {
-                coeffs: std::array::from_fn(|i| {
-                    let w = &self.weighted[i * n..(i + 1) * n];
-                    samples.iter().zip(w).map(|(s, w)| *s * *w).sum()
-                }),
-            })
-            .collect()
+        Ok(self.project_batch(&[samples])?.remove(0))
     }
 }
 
-/// Irradiance of every probe at every normal: returns `probes × normals`.
+/// Evaluates the irradiance of probes at a fixed set of surface normals,
+/// e.g. for baking per-vertex or per-texel lighting.
 ///
-/// With an NPU this is one product of the `[3·probes, 9]` coefficients with
-/// the `[9, normals]` convolved basis, e.g. for baking vertex lighting. It
-/// goes through [`compute::gemm`] with `Placement::Auto`, so small bakes run
-/// exactly on the CPU and only large ones use the NPU.
-pub fn irradiance_batch(npu: Option<&Npu>, probes: &[Sh9], normals: &[Vec3]) -> Result<Vec<Vec3>> {
-    let nn = normals.len();
-    let Some(npu) = npu else {
-        return Ok(probes
+/// The `[normals, 9]` cosine-convolved basis is the resident matrix; each
+/// [`bake`](Self::bake) streams the probes' coefficients through it, so the
+/// same normals can be lit by any number of probe sets.
+#[derive(Debug)]
+pub struct IrradianceBaker {
+    normals: usize,
+    basis: MatrixOp,
+}
+
+impl Accelerated for IrradianceBaker {
+    fn ops(&self) -> Vec<&MatrixOp> {
+        vec![&self.basis]
+    }
+    fn ops_mut(&mut self) -> Vec<&mut MatrixOp> {
+        vec![&mut self.basis]
+    }
+}
+
+accelerated_methods!(IrradianceBaker);
+
+impl IrradianceBaker {
+    /// A baker for these surface normals (normalised for you).
+    pub fn new(normals: &[Vec3]) -> Self {
+        let bases: Vec<[f32; 9]> = normals
             .iter()
-            .flat_map(|p| normals.iter().map(|&n| p.irradiance(n)))
-            .collect());
-    };
-    let mut basis_m = vec![0.0f32; nn * 9];
-    for (k, n) in normals.iter().enumerate() {
-        for (i, y) in basis(n.normalize_or(Vec3::Y)).iter().enumerate() {
-            basis_m[k * 9 + i] = y * BAND[i];
+            .map(|n| basis(n.normalize_or(Vec3::Y)))
+            .collect();
+        Self {
+            normals: normals.len(),
+            basis: MatrixOp::new(Matrix::from_fn(normals.len(), 9, |k, i| {
+                bases[k][i] * BAND[i]
+            })),
         }
     }
-    let rows: Vec<f32> = probes
-        .iter()
-        .flat_map(|p| (0..3).flat_map(move |ch| (0..9).map(move |i| p.coeffs[i][ch])))
-        .collect();
-    // [3P, 9] · [9, Nn]. Used once, so `Placement::Auto` decides: the NPU for
-    // big bakes, the (exact) CPU for a handful of probes or normals.
-    let a = Matrix::new(probes.len() * 3, 9, rows)?;
-    let b = Matrix::new(nn, 9, basis_m)?.transpose();
-    let out = compute::gemm(npu, &a, &b, Placement::Auto)?.into_vec(); // [3P, Nn]
-    Ok((0..probes.len() * nn)
-        .map(|k| {
-            let (p, n) = (k / nn.max(1), k % nn.max(1));
-            Vec3::new(
-                out[(p * 3) * nn + n],
-                out[(p * 3 + 1) * nn + n],
-                out[(p * 3 + 2) * nn + n],
-            )
-        })
-        .collect())
+
+    /// Irradiance of every probe at every normal: `result[p][k]` for probe
+    /// `p` and normal `k`.
+    pub fn bake(&self, probes: &[Sh9]) -> Result<Vec<Vec<Vec3>>> {
+        self.bake_with(probes, |rows| self.basis.apply(rows))
+    }
+
+    /// CPU reference / fallback (exact).
+    pub fn bake_cpu(&self, probes: &[Sh9]) -> Result<Vec<Vec<Vec3>>> {
+        self.bake_with(probes, |rows| self.basis.apply_cpu(rows))
+    }
+
+    fn bake_with(
+        &self,
+        probes: &[Sh9],
+        apply: impl Fn(&Matrix) -> Result<Matrix>,
+    ) -> Result<Vec<Vec<Vec3>>> {
+        if probes.is_empty() || self.normals == 0 {
+            return Ok(vec![Vec::new(); probes.len()]);
+        }
+        let rows: Vec<[f32; 9]> = probes.iter().flat_map(|p| p.channel_rows()).collect();
+        let out = apply(&Matrix::from_rows(&rows)?)?; // [3·probes, normals]
+        Ok(out
+            .as_slice()
+            .chunks_exact(3 * self.normals)
+            .map(|p| {
+                let (r, rest) = p.split_at(self.normals);
+                let (g, b) = rest.split_at(self.normals);
+                r.iter()
+                    .zip(g)
+                    .zip(b)
+                    .map(|((r, g), b)| Vec3::new(*r, *g, *b))
+                    .collect()
+            })
+            .collect())
+    }
 }

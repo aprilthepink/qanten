@@ -10,6 +10,7 @@ mod common;
 use common::Canvas;
 use glam::Vec3;
 use qanten::Npu;
+use qanten::compute::Matrix;
 use qanten_graphics::dct::Dct8x8;
 
 /// The standard JPEG luminance quantisation table.
@@ -58,18 +59,22 @@ fn compress(
     } else {
         2.0 - quality / 50.0
     };
-    let centered: Vec<f32> = plane.iter().map(|v| v - 128.0).collect();
-    let mut coeffs = dct.forward(&centered, size, size)?;
+    let centered = Matrix::from_fn(size, size, |y, x| plane[y * size + x] - 128.0);
+    let mut coeffs = dct.forward(&centered)?;
     let mut zeros = 0;
-    for (k, c) in coeffs.iter_mut().enumerate() {
-        let (y, x) = ((k / size) % 8, (k % size) % 8);
-        let step = (Q50[y * 8 + x] * scale).max(1.0);
-        *c = (*c / step).round() * step;
-        zeros += usize::from(*c == 0.0);
+    for (y, row) in coeffs.iter_rows_mut().enumerate() {
+        for (x, c) in row.iter_mut().enumerate() {
+            let step = (Q50[(y % 8) * 8 + x % 8] * scale).max(1.0);
+            *c = (*c / step).round() * step;
+            zeros += usize::from(*c == 0.0);
+        }
     }
-    let back = dct.inverse(&coeffs, size, size)?;
+    let back = dct.inverse(&coeffs)?;
     Ok((
-        back.iter().map(|v| (v + 128.0).clamp(0.0, 255.0)).collect(),
+        back.into_vec()
+            .into_iter()
+            .map(|v| (v + 128.0).clamp(0.0, 255.0))
+            .collect(),
         zeros,
     ))
 }

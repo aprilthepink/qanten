@@ -38,16 +38,16 @@ fn main() -> anyhow::Result<()> {
     let samples = 2048;
     let probes = 1024;
     let proj = ShProjector::fibonacci(samples);
-    let radiance: Vec<Vec3> = (0..probes)
-        .flat_map(|p| {
+    let radiance: Vec<Vec<Vec3>> = (0..probes)
+        .map(|p| {
             proj.directions()
                 .iter()
-                .map(move |&d| environment(p, d))
-                .collect::<Vec<_>>()
+                .map(|&d| environment(p, d))
+                .collect()
         })
         .collect();
     let t0 = Instant::now();
-    let want = proj.project_batch_cpu(&radiance);
+    let want = proj.project_batch_cpu(&radiance)?;
     let cpu_ms = ms(t0.elapsed());
     let proj = proj.with_npu(&npu)?;
     let t0 = Instant::now();

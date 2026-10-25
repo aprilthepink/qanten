@@ -16,16 +16,17 @@ product. The big, constant matrix stays on the NPU, so each frame only moves sma
 
 ```rust
 use qanten::Npu;
+use qanten::compute::Matrix;
 use qanten_graphics::dct::Dct8x8;
 
 fn main() -> qanten::Result<()> {
     let npu = Npu::auto(0)?;
     let cpu_only = Dct8x8::new();               // works without an NPU
     let accelerated = Dct8x8::new().with_npu(&npu)?; // uploads its constant matrix
-    let img = vec![0.5f32; 64 * 64];
-    let a = cpu_only.forward(&img, 64, 64)?;
-    let b = accelerated.forward(&img, 64, 64)?;  // same API, runs on the NPU
-    assert_eq!(a.len(), b.len());
+    let img = Matrix::from_fn(64, 64, |_, _| 0.5);
+    let a = cpu_only.forward(&img)?;
+    let b = accelerated.forward(&img)?;          // same API, runs on the NPU
+    assert_eq!(a.shape(), b.shape());
     Ok(())
 }
 ```
@@ -52,12 +53,15 @@ Every example prints NPU-path vs CPU-reference timing and the largest error
 
 | Example | CPU reference | NPU path (simulated) | Max error |
 |---|---|---|---|
-| `ocean`: 400², 64 waves | 104 ms | 77 ms | 2.1 cm of 11 m wave height |
+| `ocean`: 400², 64 waves | 102 ms | 76 ms | 2.4 cm of 12 m wave height |
 | `crowd`: skinning 100 × 1280 vertices | 1.5 ms | 19 ms | 7.2 mm on a 3 m mesh |
-| `crowd`: blendshapes 200 × 4000 vertices × 52 | 16 ms | 70 ms | 0.11 mm |
-| `probes`: 1024 probes × 2048 samples | 4.3 ms | 76 ms | 0.0033 (DC ≈ 1.1) |
+| `crowd`: blendshapes 200 × 4000 vertices × 52 | 18 ms | 70 ms | 0.11 mm |
+| `probes`: 1024 probes × 2048 samples | 11 ms | 65 ms | 0.0033 (DC ≈ 1.1) |
 | `dct`: 256² RGB, JPEG q50 | – | – | 42.7 dB PSNR |
 
+The CPU references for blendshapes, probes and DCT are the same exact `compute::Matrix`
+product the NPU path replaces (f64 accumulation, multithreaded). For probes that costs
+about 2.5× the old dedicated loop, because the samples are first laid out as a matrix.
 The simulator does the same multiplications as the NPU plus format conversions and the
 host-side scaling `compute::NpuMatrix` adds, so for most rows it shows correctness, not
 hardware speed. It also runs every simulated NPU on the same CPU cores, so `with_pool`
@@ -80,8 +84,9 @@ magnitudes stay small:
   its size or its distance from the origin.
 - **sh, dct**: inputs are bounded by nature (pixel values) or rescaled per vector, so an
   HDR sun 10,000× brighter than the sky doesn't wash out the rest of a probe.
-- `sh::irradiance_batch` builds its matrix for a single product, so it goes through
-  `compute::gemm` with `Placement::Auto`: small bakes run exactly on the CPU.
+- Inputs and outputs are per item: one row of weights, one slice of bone matrices or one
+  list of samples per character or probe, and one mesh or probe back for each. 2-D data
+  (DCT planes, weights) uses `qanten::compute::Matrix`.
 
 Per-row and per-vector scaling (moving to `compute::NpuMatrix`) cut the measured error
 against the CPU reference on the simulator:

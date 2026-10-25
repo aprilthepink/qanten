@@ -54,7 +54,8 @@ tracing = "0.1"
             run = subprocess.run([str(ROOT / "target/doccheck/debug/examples" / name)],
                                  capture_output=True, text=True, timeout=300)
             ok, detail = run.returncode == 0, run.stderr
-        print(f"{'ok  ' if ok else 'FAIL'} {src} [{mode}]")
+        if not ok or "--quiet" not in sys.argv:
+            print(f"{'ok  ' if ok else 'FAIL'} {src} [{mode}]")
         if not ok:
             failures += 1
             print(detail[-2000:])

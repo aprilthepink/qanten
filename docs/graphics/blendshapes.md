@@ -12,6 +12,7 @@ them for a crowd is one big matrix product with a constant matrix, a perfect NPU
 
 ```rust
 use qanten::Npu;
+use qanten::compute::Matrix;
 use qanten_graphics::blendshapes::Blendshapes;
 use qanten_graphics::glam::Vec3;
 
@@ -22,10 +23,11 @@ fn main() -> qanten::Result<()> {
     let blink = vec![Vec3::new(0.0, -0.05, 0.0); 3];
     let shapes = Blendshapes::new(base, &[smile, blink])?.with_npu(&npu)?;
 
-    // 2 characters × 2 shapes, row-major.
-    let positions = shapes.evaluate_batch(&[1.0, 0.0, 0.5, 1.0])?;
-    assert_eq!(positions.len(), 2 * 3);              // characters × vertices
-    println!("{:?}", &positions[..3]);
+    // One row of shape weights per character.
+    let weights = Matrix::from_rows(&[[1.0, 0.0], [0.5, 1.0]])?;
+    let meshes = shapes.evaluate_batch(&weights)?;   // one mesh per character
+    assert_eq!((meshes.len(), meshes[0].len()), (2, 3));
+    println!("{:?}", meshes[0]);
     Ok(())
 }
 ```
@@ -39,10 +41,11 @@ positions (as in glTF files exported from some tools) rather than offsets.
 |---|---|
 | `Blendshapes::new(base, &deltas)` | `deltas[s][v]` = offset of target `s` at vertex `v` |
 | `from_target_positions(base, &targets)` | same, from absolute target positions |
-| `.with_npu(&npu)` | uploads the `[3·vertices, shapes]` delta matrix |
-| `evaluate(&weights)` | one character |
-| `evaluate_batch(&weights)` | `characters × shapes` weights → `characters × vertices` positions |
-| `evaluate_batch_cpu(&weights)` | CPU reference |
+| `.with_npu(&npu)` / `.with_pool(&pool)` | uploads the `[3·vertices, shapes]` delta matrix |
+| `evaluate(&weights)` | one character (`&[f32]`, one weight per shape) |
+| `evaluate_batch(&weights)` | `Matrix` with one row per character → one `Vec<Vec3>` mesh per character |
+| `evaluate_batch_cpu(&weights)` | exact CPU reference |
+| `self_check()`, `is_accelerated()` | NPU accuracy check, whether it's uploaded |
 | `vertex_count()`, `shape_count()` | sizes |
 
 ## How it maps to the NPU

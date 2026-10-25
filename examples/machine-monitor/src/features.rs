@@ -15,10 +15,11 @@
 //! Plus five statistics: RMS, crest factor, kurtosis and energy of the
 //! resonance band, and the envelope spectrum's noise floor (its median).
 
-use qanten::signal::{Dft, FirBank, design, hann};
-use qanten::{Npu, Result};
+use qanten::compute::Matrix;
+use qanten::signal::{Dft, FirBank, Spectrum, design, hann};
+use qanten::{Error, Npu, Result};
 
-use crate::sim::{SAMPLE_RATE, WINDOW};
+use crate::sim::{Measurement, SAMPLE_RATE, WINDOW};
 
 const TAPS: usize = 127;
 const DECIMATE: usize = 8;
@@ -29,12 +30,15 @@ const ORDER_STEP: f32 = 0.25;
 const SPEED_ORDERS: usize = 40;
 /// Envelope orders 0.5×…12× of the resonance band.
 const ENVELOPE_ORDERS: usize = 47;
+/// Hann window coherent gain is n/2, so amplitude = 2·|X| / (n/2).
+const TO_AMPLITUDE: f32 = 4.0 / BAND_LEN as f32;
+const BIN_HZ: f32 = SAMPLE_RATE / DECIMATE as f32 / BAND_LEN as f32;
 
 /// Length of the feature vector.
 pub const NUM_FEATURES: usize = SPEED_ORDERS + ENVELOPE_ORDERS + STATS;
 const STATS: usize = 5;
 
-/// Turns raw windows into feature vectors on one NPU.
+/// Turns measurements into feature vectors on one NPU.
 #[derive(Debug)]
 pub struct FeatureExtractor {
     filters: FirBank,
@@ -42,15 +46,51 @@ pub struct FeatureExtractor {
     window: Vec<f32>,
 }
 
+/// The two decimated bands of one measurement plus its time-domain statistics.
+#[derive(Debug)]
+struct Bands {
+    low: Vec<f32>,
+    envelope: Vec<f32>,
+    /// `[log RMS, log crest factor, log kurtosis, log band RMS]`.
+    stats: [f32; 4],
+}
+
+impl Bands {
+    /// From the filter bank output (row 0 low-pass, row 1 band-pass).
+    fn new(filtered: &Matrix, signal: &[f32]) -> Self {
+        let (low, resonance) = (&filtered.row(0)[TAPS - 1..], &filtered.row(1)[TAPS - 1..]);
+        // Low band: plain decimation (it is already band-limited).
+        let low = low
+            .iter()
+            .step_by(DECIMATE)
+            .take(BAND_LEN)
+            .copied()
+            .collect();
+        // Resonance band: rectify, average blocks of 8, remove DC.
+        let mut envelope: Vec<f32> = resonance
+            .chunks(DECIMATE)
+            .take(BAND_LEN)
+            .map(|c| c.iter().map(|v| v.abs()).sum::<f32>() / c.len() as f32)
+            .collect();
+        let mean = envelope.iter().sum::<f32>() / envelope.len() as f32;
+        envelope.iter_mut().for_each(|v| *v -= mean);
+        Self {
+            low,
+            envelope,
+            stats: time_stats(signal, resonance),
+        }
+    }
+}
+
 impl FeatureExtractor {
     /// Uploads the filter bank and DFT matrix to `npu`.
     pub fn new(npu: &Npu) -> Result<Self> {
-        let nyquist_frac = |hz: f32| hz / SAMPLE_RATE;
+        let fraction = |hz: f32| hz / SAMPLE_RATE;
         let filters = FirBank::new(
             npu,
             &[
-                design::lowpass(nyquist_frac(450.0), TAPS),
-                design::bandpass(nyquist_frac(2400.0), nyquist_frac(4400.0), TAPS),
+                design::lowpass(fraction(450.0), TAPS),
+                design::bandpass(fraction(2400.0), fraction(4400.0), TAPS),
             ],
         )?;
         Ok(Self {
@@ -60,79 +100,76 @@ impl FeatureExtractor {
         })
     }
 
-    /// Features of one window measured at `shaft_hz`.
-    pub fn extract(&self, shaft_hz: f32, signal: &[f32]) -> Result<Vec<f32>> {
-        self.extract_batch(&[(shaft_hz, signal)])
+    /// Features of one measurement.
+    pub fn extract(&self, m: &Measurement) -> Result<Vec<f32>> {
+        Ok(self.extract_batch(std::slice::from_ref(m))?.into_vec())
     }
 
-    /// Features of several windows, `rows × NUM_FEATURES`. The DFTs of the
-    /// whole batch run as one NPU call.
-    pub fn extract_batch(&self, windows: &[(f32, &[f32])]) -> Result<Vec<f32>> {
-        let mut frames = Vec::with_capacity(windows.len() * 2 * BAND_LEN);
-        let mut stats = Vec::with_capacity(windows.len());
-        for &(_, signal) in windows {
-            if signal.len() != WINDOW {
-                return Err(qanten::Error::Shape(format!(
-                    "a window has {WINDOW} samples, got {}",
-                    signal.len()
-                )));
-            }
-            let bands = self.filters.apply(signal)?;
-            let (low, resonance) = (&bands[0][TAPS - 1..], &bands[1][TAPS - 1..]);
-            // Low band: plain decimation (it is already band-limited).
-            let low: Vec<f32> = low
-                .iter()
-                .step_by(DECIMATE)
-                .take(BAND_LEN)
-                .copied()
-                .collect();
-            // Resonance band: rectify, average blocks of 8, remove DC.
-            let mut env: Vec<f32> = resonance
-                .chunks(DECIMATE)
-                .take(BAND_LEN)
-                .map(|c| c.iter().map(|v| v.abs()).sum::<f32>() / c.len() as f32)
-                .collect();
-            let mean = env.iter().sum::<f32>() / env.len() as f32;
-            env.iter_mut().for_each(|v| *v -= mean);
-            for band in [&low, &env] {
-                frames.extend(band.iter().zip(&self.window).map(|(x, w)| x * w));
-            }
-            stats.push(time_stats(signal, resonance));
-        }
-        let spectrum = self.dft.forward(&frames)?;
-        let magnitude = spectrum.magnitude();
-        let bins = spectrum.bins;
-        // Hann window coherent gain is n/2; amplitude = 2·|X| / (n/2).
-        let to_amplitude = 4.0 / BAND_LEN as f32;
-        let bin_hz = SAMPLE_RATE / DECIMATE as f32 / BAND_LEN as f32;
-
-        let mut out = Vec::with_capacity(windows.len() * NUM_FEATURES);
-        for (i, &(shaft_hz, _)) in windows.iter().enumerate() {
-            let low = &magnitude[(2 * i) * bins..(2 * i + 1) * bins];
-            let env = &magnitude[(2 * i + 1) * bins..(2 * i + 2) * bins];
-            for (spec, first, count) in [(low, 1, SPEED_ORDERS), (env, 2, ENVELOPE_ORDERS)] {
-                for k in 0..count {
-                    let order = (first + k) as f32 * ORDER_STEP;
-                    let peak = order_peak(spec, order, shaft_hz, bin_hz) * to_amplitude;
-                    out.push((peak + 1e-4).log10());
+    /// Features of several measurements, one row each (`len × NUM_FEATURES`).
+    /// The DFTs of the whole batch run as one NPU call.
+    pub fn extract_batch(&self, batch: &[Measurement]) -> Result<Matrix> {
+        let bands = batch
+            .iter()
+            .map(|m| {
+                if m.samples.len() != WINDOW {
+                    return Err(Error::Shape(format!(
+                        "a measurement has {WINDOW} samples, got {}",
+                        m.samples.len()
+                    )));
                 }
-            }
-            out.extend(stats[i]);
-            // Envelope noise floor: median bin (bearing faults add peaks; broadband faults raise it).
-            let mut sorted: Vec<f32> = env[1..].to_vec();
-            sorted.sort_by(f32::total_cmp);
-            out.push((sorted[sorted.len() / 2] * to_amplitude + 1e-5).log10());
-        }
-        Ok(out)
+                Ok(Bands::new(&self.filters.apply(&m.samples)?, &m.samples))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Frames 2i (low band) and 2i + 1 (envelope), windowed, in one DFT call.
+        let frames = Matrix::from_fn(2 * bands.len(), BAND_LEN, |r, t| {
+            let b = &bands[r / 2];
+            (if r % 2 == 0 { b.low[t] } else { b.envelope[t] }) * self.window[t]
+        });
+        let magnitude = Spectrum::magnitude(&self.dft.forward(&frames)?);
+        let rows: Vec<Vec<f32>> = batch
+            .iter()
+            .zip(&bands)
+            .enumerate()
+            .map(|(i, (m, b))| {
+                let (low, env) = (magnitude.row(2 * i), magnitude.row(2 * i + 1));
+                order_features(low, m.shaft_hz, 1, SPEED_ORDERS)
+                    .chain(order_features(env, m.shaft_hz, 2, ENVELOPE_ORDERS))
+                    .chain(b.stats)
+                    .chain([noise_floor(env)])
+                    .collect()
+            })
+            .collect();
+        Matrix::from_rows(&rows)
     }
 }
 
+/// `count` features: log amplitude at orders `first·step, (first+1)·step, …`.
+fn order_features(
+    spec: &[f32],
+    shaft_hz: f32,
+    first: usize,
+    count: usize,
+) -> impl Iterator<Item = f32> + '_ {
+    (first..first + count).map(move |k| {
+        let peak = order_peak(spec, k as f32 * ORDER_STEP, shaft_hz) * TO_AMPLITUDE;
+        (peak + 1e-4).log10()
+    })
+}
+
+/// Envelope noise floor: the median bin (bearing faults add peaks; broadband
+/// faults raise the floor).
+fn noise_floor(env: &[f32]) -> f32 {
+    let mut sorted = env[1..].to_vec();
+    sorted.sort_by(f32::total_cmp);
+    (sorted[sorted.len() / 2] * TO_AMPLITUDE + 1e-5).log10()
+}
+
 /// Largest magnitude within ±half an order step of `order`.
-fn order_peak(spec: &[f32], order: f32, shaft_hz: f32, bin_hz: f32) -> f32 {
-    let lo = ((order - ORDER_STEP / 2.0) * shaft_hz / bin_hz).round() as usize;
-    let hi = ((order + ORDER_STEP / 2.0) * shaft_hz / bin_hz).round() as usize;
-    let hi = hi.max(lo).min(spec.len() - 1);
-    spec[lo.min(hi)..=hi].iter().copied().fold(0.0, f32::max)
+fn order_peak(spec: &[f32], order: f32, shaft_hz: f32) -> f32 {
+    let bin = |o: f32| (o * shaft_hz / BIN_HZ).round() as usize;
+    let hi = bin(order + ORDER_STEP / 2.0).min(spec.len() - 1);
+    let lo = bin(order - ORDER_STEP / 2.0).min(hi);
+    spec[lo..=hi].iter().copied().fold(0.0, f32::max)
 }
 
 /// `[log10 RMS, log10 crest factor, log10 kurtosis and log10 RMS of the resonance band]`.

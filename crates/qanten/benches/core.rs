@@ -165,7 +165,7 @@ fn compute(c: &mut Criterion) {
         });
         let at = a.transpose();
         g.bench_with_input(BenchmarkId::new("cpu_f32", &id), &(), |b, _| {
-            b.iter(|| black_box(&x).matmul_cpu(&at).unwrap())
+            b.iter(|| black_box(&x).matmul(&at).unwrap())
         });
     }
     g.finish();

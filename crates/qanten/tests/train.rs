@@ -24,7 +24,8 @@ fn dense_gradients_match_reference() {
         .map(|i| ((i * 7) % 11) as f32 / 11.0 - 0.5)
         .collect();
     let bias = vec![0.1, -0.2, 0.3];
-    let mut d = Dense::from_weights(&npu, w.clone(), bias.clone(), n_in, n_out).unwrap();
+    let weights = qanten::compute::Matrix::new(n_out, n_in, w.clone()).unwrap();
+    let mut d = Dense::from_weights(&npu, weights, bias.clone()).unwrap();
     let x: Vec<f32> = (0..20).map(|i| ((i * 3) % 7) as f32 / 7.0 - 0.4).collect();
     let g: Vec<f32> = (0..12).map(|i| ((i * 5) % 9) as f32 / 9.0 - 0.5).collect();
     let y = d

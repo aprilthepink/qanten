@@ -25,10 +25,11 @@ use std::f64::consts::TAU;
 use glam::{Vec2, Vec3};
 use rayon::prelude::*;
 
-use crate::accel::{ResidentMatrix, Target};
-use qanten::pool::NpuPool;
+use qanten::compute::Matrix;
+use qanten::rng::SplitMix64;
 
-use crate::{Error, Npu, Result};
+use crate::accel::{Accelerated, MatrixOp, accelerated_methods};
+use crate::{Error, Result};
 
 /// Gravity used for the deep-water dispersion relation `ω = √(g·k)`.
 pub const GRAVITY: f64 = 9.81;
@@ -75,13 +76,8 @@ pub fn wind_sea(
     choppiness: f32,
     seed: u64,
 ) -> Vec<Wave> {
-    let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
-    let mut next = move || {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        (rng >> 11) as f32 / (1u64 << 53) as f32
-    };
+    let mut rng = SplitMix64::new(seed);
+    let mut next = move || rng.next_f32();
     let wind = wind_direction.normalize_or(Vec2::X);
     let base = wind.y.atan2(wind.x);
     let n = count.max(1);
@@ -212,8 +208,20 @@ const USES_SIN: [bool; FIELDS] = [false, false, false, false, true, true, true, 
 pub struct GerstnerOcean {
     waves: Vec<Wave>,
     grid: Grid,
-    npu_basis: Option<ResidentMatrix>,
+    /// x-side table `[cos(a·x) | sin(a·x)]` (`Nx × 2W`), time-independent.
+    basis: MatrixOp,
 }
+
+impl Accelerated for GerstnerOcean {
+    fn ops(&self) -> Vec<&MatrixOp> {
+        vec![&self.basis]
+    }
+    fn ops_mut(&mut self) -> Vec<&mut MatrixOp> {
+        vec![&mut self.basis]
+    }
+}
+
+accelerated_methods!(GerstnerOcean);
 
 impl GerstnerOcean {
     /// A CPU-evaluated ocean. Fails on an empty wave list, non-positive wavelengths or an empty grid.
@@ -232,47 +240,20 @@ impl GerstnerOcean {
         if grid.resolution.0 == 0 || grid.resolution.1 == 0 {
             return Err(Error::InvalidArgument("grid resolution must be > 0".into()));
         }
-        Ok(Self {
-            waves,
-            grid,
-            npu_basis: None,
-        })
+        let basis = Self::x_basis(&waves, &grid);
+        Ok(Self { waves, grid, basis })
     }
 
-    /// Uploads the time-independent x-side basis `[cos(a·x) | sin(a·x)]`
-    /// (`Nx × 2W`) to `npu`. Later [`evaluate`](Self::evaluate) calls run there.
-    pub fn with_npu(self, npu: &Npu) -> Result<Self> {
-        self.upload_to(Target::Npu(npu))
-    }
-
-    /// Like [`with_npu`](Self::with_npu), but with a full copy on every NPU of
-    /// `pool`; each batch is split between them, so they all work at once.
-    pub fn with_pool(self, pool: &NpuPool) -> Result<Self> {
-        self.upload_to(Target::Pool(pool))
-    }
-
-    /// NPU self-test: relative error of the resident matrices on random
-    /// vectors, checked on the CPU with
-    /// [`qanten::compute::check_product`]. `None` on the CPU path. Run it now
-    /// and then on hardware: a rising value means the NPU needs recalibration.
-    pub fn self_check(&self) -> Result<Option<f64>> {
-        self.npu_basis.as_ref().map(|m| m.self_check(1)).transpose()
-    }
-
-    fn upload_to(mut self, target: Target<'_>) -> Result<Self> {
-        let xs = self.grid.xs();
-        let w = self.waves.len();
-        let mut basis = vec![0.0f32; xs.len() * 2 * w];
-        for (i, &x) in xs.iter().enumerate() {
-            for (n, wave) in self.waves.iter().enumerate() {
-                let a = wave.wavenumber() * wave.dir().0;
-                let phase = (a * x).rem_euclid(TAU);
-                basis[i * 2 * w + n] = phase.cos() as f32;
-                basis[i * 2 * w + w + n] = phase.sin() as f32;
-            }
-        }
-        self.npu_basis = Some(ResidentMatrix::upload(target, &basis, xs.len(), 2 * w)?);
-        Ok(self)
+    /// `[cos(a·x) | sin(a·x)]` for every grid column and wave, phases
+    /// reduced in f64.
+    fn x_basis(waves: &[Wave], grid: &Grid) -> MatrixOp {
+        let xs = grid.xs();
+        let w = waves.len();
+        MatrixOp::new(Matrix::from_fn(xs.len(), 2 * w, |i, col| {
+            let wave = &waves[col % w];
+            let phase = (wave.wavenumber() * wave.dir().0 * xs[i]).rem_euclid(TAU);
+            (if col < w { phase.cos() } else { phase.sin() }) as f32
+        }))
     }
 
     /// The waves.
@@ -285,51 +266,45 @@ impl GerstnerOcean {
         &self.grid
     }
 
-    /// `true` after [`with_npu`](Self::with_npu).
-    pub fn is_accelerated(&self) -> bool {
-        self.npu_basis.is_some()
-    }
-
     /// Evaluates the whole grid at time `t` (seconds). Uses the NPU if
     /// attached, otherwise [`evaluate_cpu`](Self::evaluate_cpu).
     pub fn evaluate(&self, t: f64) -> Result<OceanFrame> {
-        let Some(basis) = &self.npu_basis else {
+        if !self.basis.is_accelerated() {
             return Ok(self.evaluate_cpu(t));
-        };
+        }
         let zs = self.grid.zs();
-        let (nx, nz) = self.grid.resolution;
+        let nz = self.grid.resolution.1;
         let w = self.waves.len();
         let coeffs: Vec<[f64; FIELDS]> = self.waves.iter().map(coefficients).collect();
-
-        // z-side rows: for field f and row j, [α·cos(bz+c) or α·sin(bz+c) | ±α·(other)].
-        let mut rows = vec![0.0f32; FIELDS * nz * 2 * w];
-        rows.par_chunks_mut(nz * 2 * w)
-            .enumerate()
-            .for_each(|(f, field_rows)| {
-                for (j, &z) in zs.iter().enumerate() {
-                    let row = &mut field_rows[j * 2 * w..(j + 1) * 2 * w];
-                    for (n, wave) in self.waves.iter().enumerate() {
-                        let (_, dz) = wave.dir();
-                        let phase = (wave.wavenumber() * dz * z + wave.phase as f64
-                            - wave.angular_frequency() * t)
-                            .rem_euclid(TAU);
-                        let (s, c) = phase.sin_cos();
-                        let alpha = coeffs[n][f];
-                        if USES_SIN[f] {
-                            // Σ α sin θ = Σ (α sin) cos(ax) + (α cos) sin(ax)
-                            row[n] = (alpha * s) as f32;
-                            row[w + n] = (alpha * c) as f32;
-                        } else {
-                            // Σ α cos θ = Σ (α cos) cos(ax) − (α sin) sin(ax)
-                            row[n] = (alpha * c) as f32;
-                            row[w + n] = (-alpha * s) as f32;
-                        }
-                    }
-                }
-            });
-
-        let out = basis.apply(&rows, FIELDS * nz)?; // [FIELDS * nz, nx]
-        let field = |f: usize, j: usize, i: usize| out[(f * nz + j) * nx + i];
+        // sin/cos of the z-side phase b·z + c for every (row j, wave n).
+        let z_trig: Vec<(f64, f64)> = zs
+            .iter()
+            .flat_map(|&z| {
+                self.waves.iter().map(move |wave| {
+                    (wave.wavenumber() * wave.dir().1 * z + wave.phase as f64
+                        - wave.angular_frequency() * t)
+                        .rem_euclid(TAU)
+                        .sin_cos()
+                })
+            })
+            .collect();
+        // z-side rows (field f, row j): [cos-part | sin-part] per wave.
+        //   Σ α sin θ = Σ (α sin) cos(ax) + (α cos) sin(ax)
+        //   Σ α cos θ = Σ (α cos) cos(ax) − (α sin) sin(ax)
+        let rows = Matrix::from_fn(FIELDS * nz, 2 * w, |r, col| {
+            let (f, j, n) = (r / nz, r % nz, col % w);
+            let (s, c) = z_trig[j * w + n];
+            let alpha = coeffs[n][f];
+            let v = match (USES_SIN[f], col < w) {
+                (true, true) => alpha * s,
+                (true, false) => alpha * c,
+                (false, true) => alpha * c,
+                (false, false) => -alpha * s,
+            };
+            v as f32
+        });
+        let out = self.basis.apply(&rows)?; // [FIELDS · nz, nx]
+        let field = |f: usize, j: usize, i: usize| out[(f * nz + j, i)];
         Ok(self.assemble(|j, i| std::array::from_fn(|f| field(f, j, i))))
     }
 

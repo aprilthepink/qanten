@@ -1,7 +1,9 @@
 use std::f32::consts::TAU;
 
 use qanten::Npu;
-use qanten::signal::{self, Dft, FirBank, Stft, design};
+use qanten::compute::Matrix;
+use qanten::rng::SplitMix64;
+use qanten::signal::{Dft, FirBank, Stft, TemplateMatcher, design};
 
 fn tone(freq: f32, rate: f32, n: usize, amp: f32) -> Vec<f32> {
     (0..n)
@@ -13,25 +15,22 @@ fn tone(freq: f32, rate: f32, n: usize, amp: f32) -> Vec<f32> {
 fn dft_matches_naive_reference() {
     let npu = Npu::simulator();
     let n = 128;
-    let x: Vec<f32> = (0..2 * n)
-        .map(|t| ((t * 37) % 17) as f32 / 17.0 - 0.5)
-        .collect(); // 2 frames
+    let x = Matrix::from_fn(2, n, |f, t| (((f * n + t) * 37) % 17) as f32 / 17.0 - 0.5);
     let s = Dft::new(&npu, n).unwrap().forward(&x).unwrap();
-    assert_eq!((s.frames(), s.bins), (2, n / 2 + 1));
+    assert_eq!((s.frames(), s.bins()), (2, n / 2 + 1));
     let mut max_err = 0.0f64;
     let mut max_mag = 0.0f64;
     for f in 0..2 {
         for k in 0..=n / 2 {
             let (mut re, mut im) = (0.0f64, 0.0f64);
-            for t in 0..n {
+            for (t, &v) in x.row(f).iter().enumerate() {
                 let a = std::f64::consts::TAU * (k * t) as f64 / n as f64;
-                re += x[f * n + t] as f64 * a.cos();
-                im -= x[f * n + t] as f64 * a.sin();
+                re += v as f64 * a.cos();
+                im -= v as f64 * a.sin();
             }
-            let i = f * s.bins + k;
             max_err = max_err
-                .max((s.re[i] as f64 - re).abs())
-                .max((s.im[i] as f64 - im).abs());
+                .max((s.re[(f, k)] as f64 - re).abs())
+                .max((s.im[(f, k)] as f64 - im).abs());
             max_mag = max_mag.max(re.hypot(im));
         }
     }
@@ -74,11 +73,11 @@ fn fir_bank_separates_frequencies() {
     )
     .unwrap();
     let out = bank.apply(&mix).unwrap();
-    assert_eq!((out.len(), out[0].len()), (2, 2000));
+    assert_eq!(out.shape(), (2, 2000));
     // After the filter settles, each output should look like one component (delay = 50 taps).
     let rms = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
-    let err_low: Vec<f32> = (200..2000).map(|t| out[0][t] - low[t - 50]).collect();
-    let err_high: Vec<f32> = (200..2000).map(|t| out[1][t] - high[t - 50]).collect();
+    let err_low: Vec<f32> = (200..2000).map(|t| out[(0, t)] - low[t - 50]).collect();
+    let err_high: Vec<f32> = (200..2000).map(|t| out[(1, t)] - high[t - 50]).collect();
     assert!(rms(&err_low) < 0.05, "low-pass residual {}", rms(&err_low));
     assert!(
         rms(&err_high) < 0.05,
@@ -90,27 +89,21 @@ fn fir_bank_separates_frequencies() {
 #[test]
 fn correlation_finds_templates_in_noise() {
     let npu = Npu::simulator();
-    let mut seed = 7u64;
-    let mut noise = || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
-    };
+    let mut rng = SplitMix64::new(7);
     let chirp: Vec<f32> = (0..64)
         .map(|t| (TAU * (0.02 * t as f32 + 0.003 * (t * t) as f32)).sin())
         .collect();
     let click: Vec<f32> = (0..64)
         .map(|t| if t % 16 < 2 { 1.0 } else { -0.1 })
         .collect();
-    let mut sig: Vec<f32> = (0..2000).map(|_| 0.4 * noise()).collect();
+    let mut sig: Vec<f32> = (0..2000).map(|_| rng.uniform(-0.2, 0.2)).collect();
     for (pos, tpl) in [(300usize, &chirp), (1200, &chirp), (700, &click)] {
         for (i, v) in tpl.iter().enumerate() {
             sig[pos + i] += v;
         }
     }
-    let scores = signal::correlate(&npu, &sig, &[chirp.clone(), click.clone()]).unwrap();
-    let mut found = signal::find_matches(&scores, 64, 0.7);
+    let matcher = TemplateMatcher::new(&npu, &[chirp.clone(), click.clone()]).unwrap();
+    let mut found = matcher.scores(&sig).unwrap().matches(0.7);
     found.sort_by_key(|m| m.offset);
     let got: Vec<(usize, usize)> = found.iter().map(|m| (m.template, m.offset)).collect();
     assert_eq!(got, vec![(0, 300), (1, 700), (0, 1200)], "{found:?}");
@@ -120,7 +113,12 @@ fn correlation_finds_templates_in_noise() {
 fn bad_inputs() {
     let npu = Npu::simulator();
     assert!(Dft::new(&npu, 1).is_err());
-    assert!(Dft::new(&npu, 8).unwrap().forward(&[0.0; 9]).is_err());
+    assert!(
+        Dft::new(&npu, 8)
+            .unwrap()
+            .forward(&Matrix::zeros(1, 9))
+            .is_err()
+    );
     assert!(
         Stft::new(&npu, 64, 32)
             .unwrap()
@@ -128,4 +126,7 @@ fn bad_inputs() {
             .is_err()
     );
     assert!(FirBank::new(&npu, &[vec![1.0], vec![1.0, 2.0]]).is_err());
+    let matcher = TemplateMatcher::new(&npu, &[vec![1.0, -1.0, 1.0]]).unwrap();
+    assert!(matcher.scores(&[0.0, 1.0]).is_err());
+    assert!(TemplateMatcher::new(&npu, &[vec![1.0]]).is_err());
 }

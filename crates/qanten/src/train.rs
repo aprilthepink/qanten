@@ -44,6 +44,7 @@
 
 use std::f32::consts::FRAC_PI_2;
 
+use crate::compute::{Matrix, NpuMatrix, Placement};
 use crate::device::Npu;
 use crate::error::{Error, Result, ensure_shape};
 use crate::nn::StateDict;
@@ -86,20 +87,6 @@ pub trait Layer: Send + std::fmt::Debug {
     fn name(&self) -> &'static str;
 }
 
-fn to_bf16(v: &[f32], shape: &[usize]) -> Result<Tensor> {
-    Tensor::from_f32(v, shape.to_vec())
-}
-
-fn transpose(v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    let mut t = vec![0.0; v.len()];
-    for r in 0..rows {
-        for c in 0..cols {
-            t[c * rows + r] = v[r * cols + c];
-        }
-    }
-    t
-}
-
 fn take<T>(slot: &mut Option<T>, what: &str) -> Result<T> {
     slot.take().ok_or_else(|| {
         Error::InvalidArgument(format!("{what}: backward called without a forward pass"))
@@ -107,17 +94,21 @@ fn take<T>(slot: &mut Option<T>, what: &str) -> Result<T> {
 }
 
 /// Fully connected layer `y = x·Wᵀ + b` with `W` `[out, in]`.
+///
+/// The f32 master weights live on the host; after every optimizer step the
+/// weight matrix is uploaded once as a [`NpuMatrix`] for the forward passes.
+/// Backward products go through [`Matrix::matmul_on`], whose per-row and
+/// per-vector scaling keeps tiny gradients (≈ 1/batch) accurate in bf16 and
+/// under analog noise.
 #[derive(Debug)]
 pub struct Dense {
     npu: Npu,
-    n_in: usize,
-    n_out: usize,
-    weight: Vec<f32>,
+    weight: Matrix,
     bias: Vec<f32>,
-    grad_w: Vec<f32>,
+    grad_w: Matrix,
     grad_b: Vec<f32>,
-    weight_bf16: Tensor,
-    input: Option<Tensor>,
+    resident: NpuMatrix,
+    input: Option<Matrix>,
 }
 
 impl Dense {
@@ -125,119 +116,103 @@ impl Dense {
     pub fn new(npu: &Npu, n_in: usize, n_out: usize, seed: u64) -> Result<Self> {
         let bound = 1.0 / (n_in.max(1) as f32).sqrt();
         let mut rng = SplitMix64::new(seed);
-        let mut u = || (rng.next_f32() * 2.0 - 1.0) * bound;
-        let weight: Vec<f32> = (0..n_in * n_out).map(|_| u()).collect();
-        let bias: Vec<f32> = (0..n_out).map(|_| u()).collect();
-        Self::from_weights(npu, weight, bias, n_in, n_out)
+        let weight = Matrix::from_fn(n_out, n_in, |_, _| rng.uniform(-bound, bound));
+        let bias = (0..n_out).map(|_| rng.uniform(-bound, bound)).collect();
+        Self::from_weights(npu, weight, bias)
     }
 
     /// From existing f32 weights `[out, in]` and bias `[out]`.
-    pub fn from_weights(
-        npu: &Npu,
-        weight: Vec<f32>,
-        bias: Vec<f32>,
-        n_in: usize,
-        n_out: usize,
-    ) -> Result<Self> {
+    pub fn from_weights(npu: &Npu, weight: Matrix, bias: Vec<f32>) -> Result<Self> {
+        let (n_out, n_in) = weight.shape();
         ensure_shape!(
-            weight.len() == n_in * n_out && bias.len() == n_out,
-            "Dense: weight must be {n_out}x{n_in} and bias {n_out}"
+            bias.len() == n_out,
+            "Dense: weight is {n_out}x{n_in}, so bias must have {n_out} values"
         );
-        let weight_bf16 = to_bf16(&weight, &[n_out, n_in])?;
         Ok(Self {
             npu: npu.clone(),
-            n_in,
-            n_out,
-            grad_w: vec![0.0; weight.len()],
+            resident: NpuMatrix::upload(npu, &weight)?,
+            grad_w: Matrix::zeros(n_out, n_in),
             grad_b: vec![0.0; n_out],
             weight,
             bias,
-            weight_bf16,
             input: None,
         })
+    }
+
+    fn n_in(&self) -> usize {
+        self.weight.cols()
+    }
+
+    fn n_out(&self) -> usize {
+        self.weight.rows()
     }
 }
 
 impl Layer for Dense {
     fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
-        let [_, n] = x.dims::<2>()?;
+        let x = Matrix::from_tensor(x)?;
         ensure_shape!(
-            n == self.n_in,
-            "Dense: expected {} inputs, got {n}",
-            self.n_in
+            x.cols() == self.n_in(),
+            "Dense: expected {} inputs, got {}",
+            self.n_in(),
+            x.cols()
         );
-        let y = ops::linear(
-            &self.npu,
-            x,
-            &self.weight_bf16,
-            Some(&Tensor::from_f32(&self.bias, [self.n_out])?),
-        )?;
-        self.input = Some(x.clone());
-        Ok(y)
+        let mut y = self.resident.apply_batch(&x)?;
+        for row in y.iter_rows_mut() {
+            row.iter_mut().zip(&self.bias).for_each(|(v, b)| *v += b);
+        }
+        self.input = Some(x);
+        y.to_tensor()
     }
 
     fn backward(&mut self, grad: &Tensor) -> Result<Tensor> {
         let x = take(&mut self.input, "Dense")?;
-        let [b, o] = grad.dims::<2>()?;
+        let g = Matrix::from_tensor(grad)?;
         ensure_shape!(
-            o == self.n_out,
-            "Dense: gradient has {o} outputs, expected {}",
-            self.n_out
+            g.cols() == self.n_out(),
+            "Dense: gradient has {} outputs, expected {}",
+            g.cols(),
+            self.n_out()
         );
-        let g = grad.to_f32_vec();
-        for row in g.chunks(self.n_out) {
-            for (acc, v) in self.grad_b.iter_mut().zip(row) {
-                *acc += v;
-            }
+        for row in g.iter_rows() {
+            self.grad_b
+                .iter_mut()
+                .zip(row)
+                .for_each(|(acc, v)| *acc += v);
         }
-        // Gradients are often tiny (1/batch). Scale them to unit range before
-        // they go to the NPU and undo it afterwards, so bf16 rounding and
-        // analog noise act on O(1) values (per-tensor gradient scaling).
-        let gmax = g.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        if gmax == 0.0 {
-            return Ok(Tensor::zeros([b, self.n_in]));
-        }
-        let gs: Vec<f32> = g.iter().map(|v| v / gmax).collect();
-        // ∂W = gᵀ·x: matrix xᵀ [in, b] times vectors gᵀ [out, b] → [out, in]  (NPU)
-        let xt = transpose(&x.to_f32_vec(), b, self.n_in);
-        let gt = transpose(&gs, b, self.n_out);
-        let dw = ops::matvec(
-            &self.npu,
-            &to_bf16(&xt, &[self.n_in, b])?,
-            &to_bf16(&gt, &[self.n_out, b])?,
-        )?;
-        for (acc, v) in self.grad_w.iter_mut().zip(dw.data()) {
-            *acc += v.to_f32() * gmax;
-        }
-        // ∂x = g·W: matrix Wᵀ [in, out] times vectors g [b, out] → [b, in]  (NPU)
-        let wt = transpose(&self.weight, self.n_out, self.n_in);
-        let dx = ops::matvec(
-            &self.npu,
-            &to_bf16(&wt, &[self.n_in, self.n_out])?,
-            &to_bf16(&gs, &[b, self.n_out])?,
-        )?;
-        Ok(dx.map(|v| v * gmax))
+        let on_npu = Placement::Npu(&self.npu);
+        // ∂W = gᵀ·x  ([out, b] · [b, in])
+        let dw = g.transpose().matmul_on(&x, on_npu)?;
+        self.grad_w
+            .as_mut_slice()
+            .iter_mut()
+            .zip(dw.as_slice())
+            .for_each(|(acc, v)| *acc += v);
+        // ∂x = g·W  ([b, out] · [out, in])
+        g.matmul_on(&self.weight, on_npu)?.to_tensor()
     }
 
     fn params(&mut self) -> Vec<Param<'_>> {
+        let shape = vec![self.n_out(), self.n_in()];
+        let n_out = self.n_out();
         vec![
             Param {
                 name: "weight",
-                value: &mut self.weight,
-                grad: &mut self.grad_w,
-                shape: vec![self.n_out, self.n_in],
+                value: self.weight.as_mut_slice(),
+                grad: self.grad_w.as_mut_slice(),
+                shape,
             },
             Param {
                 name: "bias",
                 value: &mut self.bias,
                 grad: &mut self.grad_b,
-                shape: vec![self.n_out],
+                shape: vec![n_out],
             },
         ]
     }
 
     fn sync(&mut self) -> Result<()> {
-        self.weight_bf16 = to_bf16(&self.weight, &[self.n_out, self.n_in])?;
+        self.resident = NpuMatrix::upload(&self.npu, &self.weight)?;
         Ok(())
     }
 
