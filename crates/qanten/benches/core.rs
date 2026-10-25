@@ -149,5 +149,27 @@ fn models(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, matvec, elementwise, conv, models);
+fn compute(c: &mut Criterion) {
+    use qanten::compute::{Matrix, NpuMatrix};
+    let npu = npu();
+    let mut g = c.benchmark_group("compute");
+    g.sample_size(10).measurement_time(Duration::from_secs(2));
+    for &(n, k) in &[(256usize, 256usize), (1024, 256)] {
+        let a = Matrix::random_normal(n, n, 1);
+        let x = Matrix::random_normal(k, n, 2);
+        g.throughput(Throughput::Elements((n * n * k) as u64));
+        let id = format!("{n}x{n}x{k}");
+        let resident = NpuMatrix::upload(&npu, &a).unwrap();
+        g.bench_with_input(BenchmarkId::new("npu_matrix", &id), &(), |b, _| {
+            b.iter(|| resident.apply_batch(black_box(&x)).unwrap())
+        });
+        let at = a.transpose();
+        g.bench_with_input(BenchmarkId::new("cpu_f32", &id), &(), |b, _| {
+            b.iter(|| black_box(&x).matmul_cpu(&at).unwrap())
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, matvec, elementwise, conv, models, compute);
 criterion_main!(benches);

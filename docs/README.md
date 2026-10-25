@@ -17,6 +17,7 @@ layers, a simulator, a CLI, and a graphics crate that moves CPU-side 3D work ont
 | [Tensors](qanten/tensor.md) | `Tensor`: creating, reshaping, converting, `ndarray` interop |
 | [Operations](qanten/ops.md) | every op in `qanten::ops`, its shapes, and where it runs |
 | [Neural networks](qanten/nn.md) | layers, `Sequential`, `StateDict`, loading PyTorch weights |
+| [Matrix and float computation](qanten/compute.md) | `Matrix`, `NpuMatrix` (on-device, tiled, multi-NPU), `gemm` with NPU/CPU placement, accuracy checks, native `cos`/`sin` |
 | [Linear algebra](qanten/linalg.md) | CG, least squares, eigenpairs, PCA: NPU inner loops, f64-accurate results |
 | [Signal processing](qanten/signal.md) | DFT, spectrograms, FIR filter banks, template matching |
 | [ONNX models](qanten/onnx.md) | run exported `.onnx` files; 67 operators; checked against onnxruntime |

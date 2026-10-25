@@ -7,8 +7,8 @@
 //! |---|---|---|
 //! | [`Dft`] | `cos` / `sin` rows of the DFT | frames |
 //! | [`Stft`] | windowed DFT rows | overlapping frames → spectrogram |
-//! | [`FirBank`] | one row per filter | sliding windows of the signal |
-//! | [`correlate`] | one row per template | sliding windows → matches |
+//! | [`FirBank`] | every filter at every shift of a block | signal blocks |
+//! | [`correlate`] | every template at every shift of a block | signal blocks → matches |
 //!
 //! **Precision.** bfloat16 gives roughly 40–50 dB of dynamic range: plenty
 //! for spectrograms, detection, feature extraction and monitoring, not for
@@ -245,14 +245,64 @@ impl Stft {
     }
 }
 
-/// Sliding windows `[signal[t..t+len] for t in 0..=n-len]`, row-major.
-fn windows(signal: &[f32], len: usize) -> Vec<f32> {
-    let count = signal.len() + 1 - len;
-    let mut out = Vec::with_capacity(count * len);
-    for t in 0..count {
-        out.extend_from_slice(&signal[t..t + len]);
+/// Sliding dot products of several kernels against a signal, as block
+/// convolution.
+///
+/// Computes `y[t][k] = Σ_j kernel_k[j] · x[t + j]` for every `t` in
+/// `0..=n − L` (all "valid" positions). Instead of sending every length-`L`
+/// window to the NPU (`L` values per output), the signal is cut into blocks of
+/// `B` outputs. Each block needs one input segment of `B + L − 1` samples, and
+/// the resident matrix (`K·B` rows, `B + L − 1` columns) holds every kernel at
+/// every shift inside the block. That sends about `(B + L − 1) / B ≈ 2` values
+/// per output instead of `L`, for about twice the multiply-accumulates
+/// (the matrix is banded). On the NPU, moving data costs more than
+/// multiplying, so this is the better trade.
+#[derive(Debug)]
+struct BlockCorrelator {
+    len: usize,
+    kernels: usize,
+    block: usize,
+    matrix: LinearWeights,
+}
+
+impl BlockCorrelator {
+    fn new(npu: &Npu, kernels: &[Vec<f32>]) -> Result<Self> {
+        let len = kernels.first().map_or(0, Vec::len);
+        let k = kernels.len();
+        let block = len.clamp(32, 256);
+        let width = block + len - 1;
+        // Row (i·K + k): kernel k shifted to output i of the block.
+        let mut m = vec![0.0f32; block * k * width];
+        for i in 0..block {
+            for (kk, g) in kernels.iter().enumerate() {
+                let row = &mut m[(i * k + kk) * width..(i * k + kk + 1) * width];
+                row[i..i + len].copy_from_slice(g);
+            }
+        }
+        let matrix = LinearWeights::upload(npu, &Tensor::from_f32(&m, [block * k, width])?)?;
+        Ok(Self {
+            len,
+            kernels: k,
+            block,
+            matrix,
+        })
     }
-    out
+
+    /// `count × K` outputs, row-major, for `count = signal.len() − L + 1`.
+    fn apply(&self, signal: &[f32]) -> Result<Vec<f32>> {
+        let count = signal.len() + 1 - self.len;
+        let width = self.block + self.len - 1;
+        let blocks = count.div_ceil(self.block);
+        let mut segments = vec![0.0f32; blocks * width];
+        for (b, seg) in segments.chunks_mut(width).enumerate() {
+            let start = b * self.block;
+            let end = (start + width).min(signal.len());
+            seg[..end - start].copy_from_slice(&signal[start..end]);
+        }
+        let mut y = apply_scaled(&self.matrix, &segments, width)?;
+        y.truncate(count * self.kernels);
+        Ok(y)
+    }
 }
 
 /// Several FIR filters applied to one signal in a single NPU call.
@@ -260,7 +310,7 @@ fn windows(signal: &[f32], len: usize) -> Vec<f32> {
 pub struct FirBank {
     taps: usize,
     filters: usize,
-    matrix: LinearWeights,
+    conv: BlockCorrelator,
 }
 
 impl FirBank {
@@ -272,16 +322,15 @@ impl FirBank {
                 "filters must be non-empty and of equal length".into(),
             ));
         }
-        // Convolution y[t] = Σ_j h[j]·x[t−j]: against a window x[t−L+1..=t], the row is h reversed.
-        let rows: Vec<f32> = filters
+        // Convolution y[t] = Σ_j h[j]·x[t−j] is a correlation with h reversed.
+        let reversed: Vec<Vec<f32>> = filters
             .iter()
-            .flat_map(|f| f.iter().rev().copied())
+            .map(|f| f.iter().rev().copied().collect())
             .collect();
-        let matrix = LinearWeights::upload(npu, &Tensor::from_f32(&rows, [filters.len(), taps])?)?;
         Ok(Self {
             taps,
             filters: filters.len(),
-            matrix,
+            conv: BlockCorrelator::new(npu, &reversed)?,
         })
     }
 
@@ -298,7 +347,7 @@ impl FirBank {
         }
         let mut padded = vec![0.0f32; self.taps - 1];
         padded.extend_from_slice(signal);
-        let y = apply_scaled(&self.matrix, &windows(&padded, self.taps), self.taps)?; // [T, K]
+        let y = self.conv.apply(&padded)?; // [T, K]
         let mut out = vec![Vec::with_capacity(signal.len()); self.filters];
         for row in y.chunks(self.filters) {
             for (k, v) in row.iter().enumerate() {
@@ -383,16 +432,35 @@ pub fn correlate(npu: &Npu, signal: &[f32], templates: &[Vec<f32>]) -> Result<Ve
             c
         }
     };
-    let rows: Vec<f32> = templates.iter().flat_map(|t| normalise(t)).collect();
-    let w = LinearWeights::upload(npu, &Tensor::from_f32(&rows, [templates.len(), len])?)?;
-    let win: Vec<f32> = windows(signal, len)
-        .chunks(len)
-        .flat_map(normalise)
-        .collect();
-    let y = w
-        .forward(&Tensor::from_f32(&win, [win.len() / len, len])?)?
-        .to_f32_vec();
+    // Templates are zero-mean, so Σ t·(x − mean) = Σ t·x: the NPU computes the
+    // raw sliding products and the window norms come from prefix sums.
+    let kernels: Vec<Vec<f32>> = templates.iter().map(|t| normalise(t)).collect();
+    let raw = BlockCorrelator::new(npu, &kernels)?.apply(signal)?;
+    let (mut s1, mut s2) = (
+        vec![0.0f64; signal.len() + 1],
+        vec![0.0f64; signal.len() + 1],
+    );
+    for (i, &x) in signal.iter().enumerate() {
+        s1[i + 1] = s1[i] + x as f64;
+        s2[i + 1] = s2[i] + (x as f64) * (x as f64);
+    }
     let k = templates.len();
+    let y: Vec<f32> = raw
+        .chunks(k)
+        .enumerate()
+        .flat_map(|(t, row)| {
+            let sum = s1[t + len] - s1[t];
+            let var = (s2[t + len] - s2[t] - sum * sum / len as f64).max(0.0);
+            let norm = var.sqrt();
+            row.iter().map(move |&v| {
+                if norm > 1e-12 {
+                    (v as f64 / norm).clamp(-1.0, 1.0) as f32
+                } else {
+                    0.0
+                }
+            })
+        })
+        .collect();
     let mut out = vec![Vec::with_capacity(y.len() / k); k];
     for row in y.chunks(k) {
         for (t, v) in row.iter().enumerate() {

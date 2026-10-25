@@ -13,8 +13,8 @@ windows of a signal through it in a single batched call.
 |---|---|---|
 | `Dft` | DFT `cos` / `sin` rows | frames |
 | `Stft` | Hann-windowed DFT rows | overlapping frames → spectrogram |
-| `FirBank` | one row per filter | sliding windows of the signal |
-| `correlate` | one row per template | sliding windows → match scores |
+| `FirBank` | every filter at every shift within a block | signal blocks |
+| `correlate` | every template at every shift within a block | signal blocks → match scores |
 
 ## Spectrograms
 
@@ -60,7 +60,7 @@ fn main() -> qanten::Result<()> {
 }
 ```
 
-All filters run in one NPU call over all samples. `design` builds windowed-sinc filters
+All filters run in one NPU call over all samples. The signal goes over as blocks (block convolution), so each output sample costs about 2 values of traffic instead of one value per tap. In the `machine-monitor` example that cut the data sent to the NPU 52×. `design` builds windowed-sinc filters
 (Hamming window); any taps work.
 
 ## Template matching

@@ -17,3 +17,9 @@ official toolkit v2.4.0.
   crowds, SH9 light-probe baking, 8×8 DCT. CPU fallbacks and rendered examples.
 - `examples/machine-monitor`: example application, vibration-based predictive
   maintenance (NPU signal processing, training, multi-NPU monitoring, HTTP serving).
+- `qanten::compute`: general matrix and float computation: host `Matrix`,
+  device-resident `NpuMatrix` (row/vector scaling, tiling, sharding over an
+  `NpuPool`), `gemm`/`gemv` with automatic NPU/CPU placement, Freivalds
+  accuracy check `check_product`, native `cos`/`sin`/`mul` on slices.
+- `signal::FirBank` and `signal::correlate` use block convolution: about 2
+  values of NPU traffic per output sample instead of one per tap.
