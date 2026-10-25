@@ -32,6 +32,14 @@ fn main() -> qanten::Result<()> {
 
 - `new(...)` builds a CPU-only object. `with_npu(&npu)` uploads the constant part and
   returns it accelerated. The same methods then run on the NPU.
+- `with_pool(&pool)` does the same on several NPUs: each one holds a full copy and every
+  batch (characters, probes, image blocks, ocean rows) is split between them.
+- `self_check()` measures the NPU's current error on random vectors against the CPU
+  (`Some(relative error)`, `None` on the CPU path). It is cheap; run it at startup and now
+  and then on hardware to catch calibration drift.
+- Under the hood every module is one `qanten::compute::NpuMatrix` (see
+  [compute](../qanten/compute.md)): a matrix kept on the device with batches streamed
+  through it, the NPU's best case.
 - Each module also has an explicit `*_cpu` method. It is the accuracy reference in the
   tests and the fallback for batches too small to be worth a transfer.
 - `qanten_graphics::glam` re-exports the [glam](https://docs.rs/glam) math types used
@@ -44,14 +52,16 @@ Every example prints NPU-path vs CPU-reference timing and the largest error
 
 | Example | CPU reference | NPU path (simulated) | Max error |
 |---|---|---|---|
-| `ocean`: 400², 64 waves | 103 ms | 63 ms | 2 cm of 11 m wave height |
-| `crowd`: skinning 100 × 1280 vertices | 2 ms | 19 ms | 8.5 mm on a 3 m mesh |
-| `crowd`: blendshapes 200 × 4000 vertices × 52 | 22 ms | 65 ms | 0.14 mm |
-| `probes`: 1024 probes × 2048 samples | 5 ms | 46 ms | 0.005 (DC ≈ 1.1) |
+| `ocean`: 400², 64 waves | 104 ms | 77 ms | 2.1 cm of 11 m wave height |
+| `crowd`: skinning 100 × 1280 vertices | 1.5 ms | 19 ms | 7.2 mm on a 3 m mesh |
+| `crowd`: blendshapes 200 × 4000 vertices × 52 | 16 ms | 70 ms | 0.11 mm |
+| `probes`: 1024 probes × 2048 samples | 4.3 ms | 76 ms | 0.0033 (DC ≈ 1.1) |
 | `dct`: 256² RGB, JPEG q50 | – | – | 42.7 dB PSNR |
 
-The simulator does the same multiplications as the NPU plus format conversions, so for
-most rows it shows correctness, not hardware speed. The ocean is the exception: its
+The simulator does the same multiplications as the NPU plus format conversions and the
+host-side scaling `compute::NpuMatrix` adds, so for most rows it shows correctness, not
+hardware speed. It also runs every simulated NPU on the same CPU cores, so `with_pool`
+shows no speedup there; on hardware each card is separate silicon. The ocean is the exception: its
 matrix formulation beats the usual per-point loop even on a plain CPU. Real speedups for
 the other modules depend on the card's throughput and transfer cost, which still needs
 measuring on hardware.
@@ -59,15 +69,30 @@ measuring on hardware.
 ## Precision
 
 The NPU computes in bfloat16 (about 3 significant digits), so each output carries an
-error of roughly 0.5 % of its magnitude. The modules are arranged so the magnitudes stay
-small:
+error of roughly 0.5 % of its magnitude. `NpuMatrix` scales every matrix row and every
+input vector to unit range before it reaches the NPU, and the modules are arranged so the
+magnitudes stay small:
 
 - **ocean**: wave phases are reduced modulo 2π on the host in f64; the NPU only sees
   values in `[-1, 1] × amplitude`.
 - **skinning, blendshapes**: the NPU computes offsets from the rest pose; positions are
   added back in f32 on the host. The error scales with how far the mesh moved, not with
   its size or its distance from the origin.
-- **sh, dct**: inputs are bounded by nature (radiance, pixel values).
+- **sh, dct**: inputs are bounded by nature (pixel values) or rescaled per vector, so an
+  HDR sun 10,000× brighter than the sky doesn't wash out the rest of a probe.
+- `sh::irradiance_batch` builds its matrix for a single product, so it goes through
+  `compute::gemm` with `Placement::Auto`: small bakes run exactly on the CPU.
+
+Per-row and per-vector scaling (moving to `compute::NpuMatrix`) cut the measured error
+against the CPU reference on the simulator:
+
+| Workload | Before | After |
+|---|---|---|
+| skinning, mesh 100 m from the origin | 1.3e-4 | 3.7e-5 |
+| blendshapes, deltas spanning 4 orders of magnitude | 3.2e-3 | 1.8e-3 |
+| SH projection, HDR sun at 5·10⁴ | 3.2e-3 | 1.4e-3 |
+| ocean (max position error / wave height) | 2.5e-3 | 2.4e-3 |
+| DCT 256² | 2.5e-3 | 2.4e-3 |
 
 Good for physics proxies, culling, picking, baking and previews. Not a replacement for
 exact final-frame geometry.

@@ -29,3 +29,9 @@ official toolkit v2.4.0.
   never sees; two new features (band energy, envelope floor).
 - `NpuExecutor`: a job's in-flight count drops before its result is
   published, so `queue_depths()` is never stale right after `wait()`.
+- `compute::NpuMatrix::upload_replicated`: a full copy per NPU with batches
+  split between them (vs `upload_pool`, which shards rows).
+- `qanten-graphics` is built on `compute::NpuMatrix`: per-row/per-vector
+  scaling (up to 3.4x lower error), `with_pool(&pool)` on every type,
+  `self_check()` via `check_product`, and `sh::irradiance_batch` through
+  `compute::gemm` with `Placement::Auto`.

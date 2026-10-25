@@ -11,7 +11,9 @@
 use glam::Vec3;
 use rayon::prelude::*;
 
-use crate::accel::ResidentMatrix;
+use crate::accel::{ResidentMatrix, Target};
+use qanten::pool::NpuPool;
+
 use crate::{Error, Npu, Result};
 
 /// A base mesh plus morph-target offsets.
@@ -58,9 +60,27 @@ impl Blendshapes {
     }
 
     /// Uploads the delta matrix to `npu`.
-    pub fn with_npu(mut self, npu: &Npu) -> Result<Self> {
+    pub fn with_npu(self, npu: &Npu) -> Result<Self> {
+        self.upload_to(Target::Npu(npu))
+    }
+
+    /// Like [`with_npu`](Self::with_npu), but with a full copy on every NPU of
+    /// `pool`; each batch is split between them, so they all work at once.
+    pub fn with_pool(self, pool: &NpuPool) -> Result<Self> {
+        self.upload_to(Target::Pool(pool))
+    }
+
+    /// NPU self-test: relative error of the resident matrices on random
+    /// vectors, checked on the CPU with
+    /// [`qanten::compute::check_product`]. `None` on the CPU path. Run it now
+    /// and then on hardware: a rising value means the NPU needs recalibration.
+    pub fn self_check(&self) -> Result<Option<f64>> {
+        self.npu.as_ref().map(|m| m.self_check(1)).transpose()
+    }
+
+    fn upload_to(mut self, target: Target<'_>) -> Result<Self> {
         self.npu = Some(ResidentMatrix::upload(
-            npu,
+            target,
             &self.deltas,
             3 * self.base.len(),
             self.shapes,

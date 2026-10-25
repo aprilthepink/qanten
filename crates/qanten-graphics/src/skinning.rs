@@ -21,7 +21,9 @@
 use glam::{Mat4, Vec3};
 use rayon::prelude::*;
 
-use crate::accel::ResidentMatrix;
+use crate::accel::{ResidentMatrix, Target, worst_check};
+use qanten::pool::NpuPool;
+
 use crate::{Error, Npu, Result};
 
 /// Up to four bone influences per vertex (unused slots have weight 0).
@@ -94,7 +96,28 @@ impl SkinnedMesh {
     ///
     /// Memory: `vertices × 4·bones` (plus `vertices × 3·bones` with normals)
     /// bf16 values, e.g. 20k vertices × 64 bones ≈ 10 MB.
-    pub fn with_npu(mut self, npu: &Npu) -> Result<Self> {
+    pub fn with_npu(self, npu: &Npu) -> Result<Self> {
+        self.upload_to(Target::Npu(npu))
+    }
+
+    /// Like [`with_npu`](Self::with_npu), but with a full copy on every NPU of
+    /// `pool`; each batch is split between them, so they all work at once.
+    pub fn with_pool(self, pool: &NpuPool) -> Result<Self> {
+        self.upload_to(Target::Pool(pool))
+    }
+
+    /// NPU self-test: relative error of the resident matrices on random
+    /// vectors, checked on the CPU with
+    /// [`qanten::compute::check_product`]. `None` on the CPU path. Run it now
+    /// and then on hardware: a rising value means the NPU needs recalibration.
+    pub fn self_check(&self) -> Result<Option<f64>> {
+        self.npu
+            .as_ref()
+            .map(|s| worst_check(std::iter::once(&s.positions).chain(s.normals.as_ref()), 1))
+            .transpose()
+    }
+
+    fn upload_to(mut self, target: Target<'_>) -> Result<Self> {
         let (v, b) = (self.rest.len(), self.bones);
         let mut a = vec![0.0f32; v * 4 * b];
         for (vi, (p, inf)) in self.rest.iter().zip(&self.influences).enumerate() {
@@ -105,7 +128,7 @@ impl SkinnedMesh {
                 }
             }
         }
-        let positions = ResidentMatrix::upload(npu, &a, v, 4 * b)?;
+        let positions = ResidentMatrix::upload(target, &a, v, 4 * b)?;
         let normals = match &self.rest_normals {
             Some(ns) => {
                 let mut m = vec![0.0f32; v * 3 * b];
@@ -116,7 +139,7 @@ impl SkinnedMesh {
                         }
                     }
                 }
-                Some(ResidentMatrix::upload(npu, &m, v, 3 * b)?)
+                Some(ResidentMatrix::upload(target, &m, v, 3 * b)?)
             }
             None => None,
         };

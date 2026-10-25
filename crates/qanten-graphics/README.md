@@ -21,7 +21,10 @@ matrix kept resident on the NPU, so each frame only moves small inputs.
 | `dct` | 8×8 block DCT / inverse for image and texture pipelines | resident 64×64 Kronecker matrix × all blocks |
 
 Every type works on the CPU out of the box and moves to the NPU with
-`.with_npu(&npu)`. The CPU path is also the accuracy reference in tests.
+`.with_npu(&npu)`, or onto several with `.with_pool(&pool)` (a copy per NPU,
+batches split between them). `.self_check()` reports the NPU's current
+error against the CPU. The CPU path is also the accuracy reference in
+tests. Every module is built on `qanten::compute::NpuMatrix`.
 
 ```rust
 use qanten::Npu;
@@ -66,8 +69,9 @@ find out.
 
 ## Precision
 
-The NPU computes in bfloat16 (about 3 significant digits). The modules keep
-values bounded: phases are reduced on the host in f64; skinning and
+The NPU computes in bfloat16 (about 3 significant digits). Every matrix row
+and input vector is scaled to unit range before it reaches the NPU, and the
+modules keep values bounded: phases are reduced on the host in f64; skinning and
 blendshapes compute offsets from the rest pose, so the error scales with how
 far the mesh moved, not with its size. That is fine for physics proxies,
 culling, baking and previews, not for exact final-frame geometry.

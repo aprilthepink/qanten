@@ -25,7 +25,9 @@ use std::f64::consts::TAU;
 use glam::{Vec2, Vec3};
 use rayon::prelude::*;
 
-use crate::accel::ResidentMatrix;
+use crate::accel::{ResidentMatrix, Target};
+use qanten::pool::NpuPool;
+
 use crate::{Error, Npu, Result};
 
 /// Gravity used for the deep-water dispersion relation `ω = √(g·k)`.
@@ -239,7 +241,25 @@ impl GerstnerOcean {
 
     /// Uploads the time-independent x-side basis `[cos(a·x) | sin(a·x)]`
     /// (`Nx × 2W`) to `npu`. Later [`evaluate`](Self::evaluate) calls run there.
-    pub fn with_npu(mut self, npu: &Npu) -> Result<Self> {
+    pub fn with_npu(self, npu: &Npu) -> Result<Self> {
+        self.upload_to(Target::Npu(npu))
+    }
+
+    /// Like [`with_npu`](Self::with_npu), but with a full copy on every NPU of
+    /// `pool`; each batch is split between them, so they all work at once.
+    pub fn with_pool(self, pool: &NpuPool) -> Result<Self> {
+        self.upload_to(Target::Pool(pool))
+    }
+
+    /// NPU self-test: relative error of the resident matrices on random
+    /// vectors, checked on the CPU with
+    /// [`qanten::compute::check_product`]. `None` on the CPU path. Run it now
+    /// and then on hardware: a rising value means the NPU needs recalibration.
+    pub fn self_check(&self) -> Result<Option<f64>> {
+        self.npu_basis.as_ref().map(|m| m.self_check(1)).transpose()
+    }
+
+    fn upload_to(mut self, target: Target<'_>) -> Result<Self> {
         let xs = self.grid.xs();
         let w = self.waves.len();
         let mut basis = vec![0.0f32; xs.len() * 2 * w];
@@ -251,7 +271,7 @@ impl GerstnerOcean {
                 basis[i * 2 * w + w + n] = phase.sin() as f32;
             }
         }
-        self.npu_basis = Some(ResidentMatrix::upload(npu, &basis, xs.len(), 2 * w)?);
+        self.npu_basis = Some(ResidentMatrix::upload(target, &basis, xs.len(), 2 * w)?);
         Ok(self)
     }
 

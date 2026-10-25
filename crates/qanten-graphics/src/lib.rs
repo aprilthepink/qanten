@@ -15,11 +15,19 @@
 //! | [`dct`] | 8×8 block DCT for texture / image pipelines | resident 64×64 Kronecker matrix × blocks |
 //!
 //! Every type works without an NPU (plain CPU path) and switches to the NPU
-//! with `.with_npu(&npu)`. The CPU path doubles as the accuracy reference.
+//! with `.with_npu(&npu)`, or to several NPUs with `.with_pool(&pool)` (a
+//! full copy on each, batches split between them). `.self_check()` measures
+//! the NPU's current error against the CPU. The CPU path doubles as the
+//! accuracy reference.
+//!
+//! Each module keeps one [`qanten::compute::NpuMatrix`] on the device and
+//! streams its batches through it, the NPU's best case (see the
+//! `compute` docs).
 //!
 //! ## Precision
 //!
-//! The NPU computes in bfloat16 (~3 significant digits). Each module is
+//! The NPU computes in bfloat16 (~3 significant digits). `NpuMatrix` scales
+//! every matrix row and input vector to unit range, and each module is
 //! arranged so only bounded quantities go through it: phases are reduced on
 //! the host in f64, skinning and blendshapes compute *offsets* from the rest
 //! pose rather than absolute positions. Expect errors around 0.5 % of the

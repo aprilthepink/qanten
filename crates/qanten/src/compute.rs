@@ -339,6 +339,9 @@ pub struct NpuMatrix {
     cols: usize,
     npus: Vec<Npu>,
     tiles: Vec<Tile>,
+    /// Full copies, one per NPU ([`upload_replicated`](Self::upload_replicated));
+    /// empty for tiled / sharded matrices.
+    replicas: Vec<NpuMatrix>,
 }
 
 impl NpuMatrix {
@@ -347,8 +350,32 @@ impl NpuMatrix {
         Self::upload_tiled(std::slice::from_ref(npu), a, Tiling::default())
     }
 
-    /// Uploads `a` split into one row block per NPU of `pool`; products run
-    /// on all of them in parallel.
+    /// Uploads a full copy of `a` to every NPU of `pool`. Each batch is split
+    /// between the copies, so every vector goes to one NPU only.
+    ///
+    /// This is the layout for throughput: use it whenever the matrix fits on
+    /// one device. Use [`upload_pool`](Self::upload_pool) (sharding) only
+    /// when it doesn't, because a sharded matrix needs every vector on every
+    /// NPU.
+    pub fn upload_replicated(pool: &NpuPool, a: &Matrix) -> Result<Self> {
+        let replicas = pool
+            .npus()
+            .iter()
+            .map(|npu| Self::upload(npu, a))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            rows: a.rows,
+            cols: a.cols,
+            npus: pool.npus().to_vec(),
+            tiles: Vec::new(),
+            replicas,
+        })
+    }
+
+    /// Uploads `a` split into one row block per NPU of `pool` (sharding);
+    /// products run on all of them in parallel. Each NPU holds `1/n` of the
+    /// matrix, but every vector is sent to every NPU, so prefer
+    /// [`upload_replicated`](Self::upload_replicated) when the matrix fits.
     pub fn upload_pool(pool: &NpuPool, a: &Matrix) -> Result<Self> {
         let per = a.rows.div_ceil(pool.len().max(1)).max(1);
         Self::upload_tiled(
@@ -403,6 +430,7 @@ impl NpuMatrix {
             cols: a.cols,
             npus: npus.to_vec(),
             tiles,
+            replicas: Vec::new(),
         })
     }
 
@@ -416,9 +444,14 @@ impl NpuMatrix {
         self.cols
     }
 
-    /// Number of tiles.
+    /// Number of tiles (over all copies).
     pub fn tiles(&self) -> usize {
-        self.tiles.len()
+        self.tiles.len() + self.replicas.iter().map(NpuMatrix::tiles).sum::<usize>()
+    }
+
+    /// Number of NPUs holding (part of) the matrix.
+    pub fn npus(&self) -> usize {
+        self.npus.len()
     }
 
     /// `y = A · x` for one vector. Prefer [`apply_batch`](Self::apply_batch):
@@ -441,6 +474,9 @@ impl NpuMatrix {
         let k = x.rows;
         if k == 0 {
             return Ok(Matrix::zeros(0, self.rows));
+        }
+        if !self.replicas.is_empty() {
+            return self.apply_replicated(x);
         }
         // Run each NPU's tiles on its own thread; collect (tile, k × rows partial).
         let partials: Vec<Result<Vec<TileOutput>>> = std::thread::scope(|s| {
@@ -478,6 +514,39 @@ impl NpuMatrix {
             }
         }
         Ok(y)
+    }
+
+    /// Splits the rows of `x` between the copies, one thread per NPU.
+    fn apply_replicated(&self, x: &Matrix) -> Result<Matrix> {
+        let per = x.rows.div_ceil(self.replicas.len()).max(1);
+        let parts: Vec<Result<Matrix>> = std::thread::scope(|s| {
+            let handles: Vec<_> = self
+                .replicas
+                .iter()
+                .zip(x.data.chunks(per * x.cols))
+                .map(|(copy, chunk)| {
+                    s.spawn(move || {
+                        copy.apply_batch(&Matrix::new(
+                            chunk.len() / x.cols,
+                            x.cols,
+                            chunk.to_vec(),
+                        )?)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(Error::Unsupported("NPU thread panicked".into())))
+                })
+                .collect()
+        });
+        let mut data = Vec::with_capacity(x.rows * self.rows);
+        for p in parts {
+            data.extend(p?.data);
+        }
+        Matrix::new(x.rows, self.rows, data)
     }
 
     /// `A · B` with `B` of shape `cols × n`: streams the `n` columns of `B`.

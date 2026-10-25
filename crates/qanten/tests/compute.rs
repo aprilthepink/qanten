@@ -90,6 +90,32 @@ fn tiles_and_pools_give_the_same_answer() {
             "every NPU holds a shard and works"
         );
     }
+
+    // Replicated: a full copy per NPU, the batch split between them.
+    let before: Vec<u64> = profilers
+        .iter()
+        .map(|p| p.report().total().bytes_to_device)
+        .collect();
+    let replicated = NpuMatrix::upload_replicated(&pool, &a).unwrap();
+    assert_eq!((replicated.tiles(), replicated.npus()), (3, 3));
+    let y = replicated.apply_batch(&x).unwrap();
+    assert!(y.relative_error(&exact) < 1e-2);
+    assert_eq!(
+        y.row(7),
+        NpuMatrix::upload(&npu, &a)
+            .unwrap()
+            .apply(x.row(7))
+            .unwrap()
+    );
+    let sent: u64 = profilers
+        .iter()
+        .zip(&before)
+        .map(|(p, b)| p.report().total().bytes_to_device - b)
+        .sum();
+    // 3 matrix copies + each vector once (bf16), not three times.
+    assert_eq!(sent, (3 * 70 * 90 + 20 * 90) as u64 * 2);
+    let small = Matrix::random_normal(2, 90, 9); // fewer vectors than NPUs
+    assert_eq!(replicated.apply_batch(&small).unwrap().rows(), 2);
 }
 
 #[test]

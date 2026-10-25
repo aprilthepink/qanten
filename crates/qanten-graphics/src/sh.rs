@@ -14,7 +14,10 @@ use std::f32::consts::PI;
 use glam::Vec3;
 use rayon::prelude::*;
 
-use crate::accel::ResidentMatrix;
+use crate::accel::{ResidentMatrix, Target};
+use qanten::compute::{self, Matrix, Placement};
+use qanten::pool::NpuPool;
+
 use crate::{Error, Npu, Result};
 
 /// Real SH basis `Y_lm(d)` for `l ≤ 2`, `d` a unit vector (y up).
@@ -130,9 +133,27 @@ impl ShProjector {
     }
 
     /// Uploads the weighted basis to `npu`; later projections run there.
-    pub fn with_npu(mut self, npu: &Npu) -> Result<Self> {
+    pub fn with_npu(self, npu: &Npu) -> Result<Self> {
+        self.upload_to(Target::Npu(npu))
+    }
+
+    /// Like [`with_npu`](Self::with_npu), but with a full copy on every NPU of
+    /// `pool`; each batch is split between them, so they all work at once.
+    pub fn with_pool(self, pool: &NpuPool) -> Result<Self> {
+        self.upload_to(Target::Pool(pool))
+    }
+
+    /// NPU self-test: relative error of the resident matrices on random
+    /// vectors, checked on the CPU with
+    /// [`qanten::compute::check_product`]. `None` on the CPU path. Run it now
+    /// and then on hardware: a rising value means the NPU needs recalibration.
+    pub fn self_check(&self) -> Result<Option<f64>> {
+        self.npu.as_ref().map(|m| m.self_check(1)).transpose()
+    }
+
+    fn upload_to(mut self, target: Target<'_>) -> Result<Self> {
         self.npu = Some(ResidentMatrix::upload(
-            npu,
+            target,
             &self.weighted,
             9,
             self.dirs.len(),
@@ -206,8 +227,10 @@ impl ShProjector {
 
 /// Irradiance of every probe at every normal: returns `probes × normals`.
 ///
-/// With an NPU this is one product of the `[normals, 9]` convolved basis
-/// with the `[3·probes, 9]` coefficients, e.g. for baking vertex lighting.
+/// With an NPU this is one product of the `[3·probes, 9]` coefficients with
+/// the `[9, normals]` convolved basis, e.g. for baking vertex lighting. It
+/// goes through [`compute::gemm`] with `Placement::Auto`, so small bakes run
+/// exactly on the CPU and only large ones use the NPU.
 pub fn irradiance_batch(npu: Option<&Npu>, probes: &[Sh9], normals: &[Vec3]) -> Result<Vec<Vec3>> {
     let nn = normals.len();
     let Some(npu) = npu else {
@@ -222,12 +245,15 @@ pub fn irradiance_batch(npu: Option<&Npu>, probes: &[Sh9], normals: &[Vec3]) -> 
             basis_m[k * 9 + i] = y * BAND[i];
         }
     }
-    let m = ResidentMatrix::upload(npu, &basis_m, nn, 9)?;
     let rows: Vec<f32> = probes
         .iter()
         .flat_map(|p| (0..3).flat_map(move |ch| (0..9).map(move |i| p.coeffs[i][ch])))
         .collect();
-    let out = m.apply(&rows, probes.len() * 3)?; // [3P, Nn]
+    // [3P, 9] · [9, Nn]. Used once, so `Placement::Auto` decides: the NPU for
+    // big bakes, the (exact) CPU for a handful of probes or normals.
+    let a = Matrix::new(probes.len() * 3, 9, rows)?;
+    let b = Matrix::new(nn, 9, basis_m)?.transpose();
+    let out = compute::gemm(npu, &a, &b, Placement::Auto)?.into_vec(); // [3P, Nn]
     Ok((0..probes.len() * nn)
         .map(|k| {
             let (p, n) = (k / nn.max(1), k % nn.max(1));

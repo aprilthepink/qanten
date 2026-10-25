@@ -80,7 +80,27 @@ around `1e-6` and one around `1e6` get the same relative accuracy. Analog
 hardware works best with values in a fixed range, so this matters more there
 than on the simulator.
 
-### Tiles and several NPUs
+### Several NPUs: replicate or shard
+
+| Layout | Each NPU holds | Each vector goes to | Use when |
+|---|---|---|---|
+| `NpuMatrix::upload_replicated(&pool, &a)` | a full copy | one NPU (batch split) | the matrix fits on one device; best throughput |
+| `NpuMatrix::upload_pool(&pool, &a)` | `1/n` of the rows | every NPU | the matrix is too big for one device |
+
+```rust
+use qanten::compute::{Matrix, NpuMatrix};
+use qanten::pool::NpuPool;
+
+let pool = NpuPool::simulated(3)?;
+let a = Matrix::random_normal(256, 256, 1);
+let replicated = NpuMatrix::upload_replicated(&pool, &a)?;
+let y = replicated.apply_batch(&Matrix::random_normal(3000, 256, 2))?;  // 1000 vectors per NPU
+assert_eq!((replicated.npus(), y.rows()), (3, 3000));
+```
+
+`qanten-graphics` uses replication for `with_pool`.
+
+### Tiles and sharding
 
 ```rust
 use qanten::compute::{Matrix, NpuMatrix, Tiling};

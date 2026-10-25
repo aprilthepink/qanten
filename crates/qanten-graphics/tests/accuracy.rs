@@ -169,3 +169,100 @@ fn dct_roundtrip() {
     assert!(img.iter().zip(&back_npu).all(|(a, b)| (a - b).abs() < 0.02));
     assert!(cpu.forward(&img, 30, 16).is_err());
 }
+
+#[test]
+fn pools_match_one_npu_and_self_checks_pass() {
+    use qanten::pool::NpuPool;
+    let pool = NpuPool::simulated(3).unwrap();
+    let one = Npu::simulator();
+
+    // Ocean: each NPU gets a share of the rows; results identical to one NPU.
+    let waves = wind_sea(16, Vec2::X, 40.0, 0.7, 3);
+    let grid = Grid::new(Vec2::ZERO, Vec2::new(80.0, 60.0), 40, 31);
+    let a = GerstnerOcean::new(waves.clone(), grid)
+        .unwrap()
+        .with_npu(&one)
+        .unwrap();
+    let b = GerstnerOcean::new(waves.clone(), grid)
+        .unwrap()
+        .with_pool(&pool)
+        .unwrap();
+    assert_eq!(
+        a.evaluate(3.0).unwrap().positions,
+        b.evaluate(3.0).unwrap().positions
+    );
+    let cpu = GerstnerOcean::new(waves, grid).unwrap();
+    assert_eq!(cpu.self_check().unwrap(), None);
+
+    // Skinning: many characters split across the pool.
+    let rest: Vec<Vec3> = (0..100)
+        .map(|i| Vec3::new(0.0, i as f32 * 0.02, 0.0))
+        .collect();
+    let infl: Vec<_> = (0..100)
+        .map(|i| {
+            [
+                (0, 1.0 - i as f32 / 99.0),
+                (1, i as f32 / 99.0),
+                (0, 0.0),
+                (0, 0.0),
+            ]
+        })
+        .collect();
+    let poses: Vec<Mat4> = (0..10)
+        .flat_map(|c| [Mat4::IDENTITY, Mat4::from_rotation_z(c as f32 * 0.1)])
+        .collect();
+    let m1 = SkinnedMesh::new(rest.clone(), None, infl.clone(), 2)
+        .unwrap()
+        .with_npu(&one)
+        .unwrap();
+    let m3 = SkinnedMesh::new(rest, None, infl, 2)
+        .unwrap()
+        .with_pool(&pool)
+        .unwrap();
+    assert_eq!(
+        m1.skin_batch(&poses).unwrap().positions,
+        m3.skin_batch(&poses).unwrap().positions
+    );
+
+    // Every accelerated type reports a small self-check error.
+    let checks = [
+        b.self_check().unwrap(),
+        m3.self_check().unwrap(),
+        ShProjector::fibonacci(256)
+            .with_pool(&pool)
+            .unwrap()
+            .self_check()
+            .unwrap(),
+        Dct8x8::new()
+            .with_pool(&pool)
+            .unwrap()
+            .self_check()
+            .unwrap(),
+        Blendshapes::new(
+            vec![Vec3::ZERO; 10],
+            &[vec![Vec3::ONE; 10], vec![Vec3::X; 10]],
+        )
+        .unwrap()
+        .with_npu(&one)
+        .unwrap()
+        .self_check()
+        .unwrap(),
+    ];
+    for c in checks {
+        let err = c.expect("accelerated");
+        assert!(err < 1e-2, "self-check error {err}");
+    }
+}
+
+#[test]
+fn small_irradiance_bakes_stay_exact_on_the_cpu() {
+    // A few probes × normals: Placement::Auto keeps it on the CPU, so the
+    // "NPU" result is exactly the CPU result.
+    let probes = [ShProjector::fibonacci(512)
+        .project_fn(|d| Vec3::new(1.0 + d.y, 0.5, 0.2))
+        .unwrap()];
+    let normals = [Vec3::Y, Vec3::X, Vec3::Z];
+    let a = sh::irradiance_batch(Some(&Npu::simulator()), &probes, &normals).unwrap();
+    let b = sh::irradiance_batch(None, &probes, &normals).unwrap();
+    assert!(max_err(&a, &b) < 1e-5, "{}", max_err(&a, &b));
+}

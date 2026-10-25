@@ -53,13 +53,14 @@ fn ocean(c: &mut Criterion) {
     g.finish();
 }
 
-fn skinning(c: &mut Criterion) {
-    let npu = npu();
-    let (verts, bones, chars) = (1280usize, 12usize, 20usize);
-    let rest: Vec<Vec3> = (0..verts)
+fn mesh_rest(mesh: &SkinnedMesh) -> Vec<Vec3> {
+    (0..mesh.vertex_count())
         .map(|i| Vec3::new((i % 20) as f32 * 0.01, i as f32 * 0.002, 0.0))
-        .collect();
-    let infl = (0..verts)
+        .collect()
+}
+
+fn mesh_infl(verts: usize, bones: usize) -> Vec<[(u16, f32); 4]> {
+    (0..verts)
         .map(|i| {
             let b = (i * bones / verts) as u16;
             [
@@ -69,8 +70,16 @@ fn skinning(c: &mut Criterion) {
                 (0, 0.0),
             ]
         })
+        .collect()
+}
+
+fn skinning(c: &mut Criterion) {
+    let npu = npu();
+    let (verts, bones, chars) = (1280usize, 12usize, 60usize);
+    let rest: Vec<Vec3> = (0..verts)
+        .map(|i| Vec3::new((i % 20) as f32 * 0.01, i as f32 * 0.002, 0.0))
         .collect();
-    let mesh = SkinnedMesh::new(rest, None, infl, bones).unwrap();
+    let mesh = SkinnedMesh::new(rest, None, mesh_infl(verts, bones), bones).unwrap();
     let poses: Vec<Mat4> = (0..chars * bones)
         .map(|k| {
             Mat4::from_rotation_translation(
@@ -79,13 +88,22 @@ fn skinning(c: &mut Criterion) {
             )
         })
         .collect();
-    let mut g = group(c, "skinning_20x1280v_12b");
+    let mut g = group(c, "skinning_60x1280v_12b");
     g.bench_function("cpu_lbs", |b| {
         b.iter(|| mesh.skin_batch_cpu(black_box(&poses)))
     });
+    let pool = qanten::pool::NpuPool::simulated(3).unwrap();
+    let pooled = SkinnedMesh::new(mesh_rest(&mesh), None, mesh_infl(verts, bones), bones)
+        .unwrap()
+        .with_pool(&pool)
+        .unwrap();
     let mesh = mesh.with_npu(&npu).unwrap();
     g.bench_function("npu_matmul", |b| {
         b.iter(|| mesh.skin_batch(black_box(&poses)).unwrap())
+    });
+    // A copy of the skinning matrix on each of 3 NPUs; characters split between them.
+    g.bench_function("npu_pool3", |b| {
+        b.iter(|| pooled.skin_batch(black_box(&poses)).unwrap())
     });
     g.finish();
 }

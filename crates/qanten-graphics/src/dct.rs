@@ -9,7 +9,9 @@
 
 use rayon::prelude::*;
 
-use crate::accel::ResidentMatrix;
+use crate::accel::{ResidentMatrix, Target, worst_check};
+use qanten::pool::NpuPool;
+
 use crate::{Error, Npu, Result};
 
 /// Orthonormal 8×8 DCT-II and its inverse.
@@ -59,10 +61,31 @@ impl Dct8x8 {
     }
 
     /// Uploads both matrices to `npu`; later calls run there.
-    pub fn with_npu(mut self, npu: &Npu) -> Result<Self> {
+    pub fn with_npu(self, npu: &Npu) -> Result<Self> {
+        self.upload_to(Target::Npu(npu))
+    }
+
+    /// Like [`with_npu`](Self::with_npu), but with a full copy on every NPU of
+    /// `pool`; each batch is split between them, so they all work at once.
+    pub fn with_pool(self, pool: &NpuPool) -> Result<Self> {
+        self.upload_to(Target::Pool(pool))
+    }
+
+    /// NPU self-test: relative error of the resident matrices on random
+    /// vectors, checked on the CPU with
+    /// [`qanten::compute::check_product`]. `None` on the CPU path. Run it now
+    /// and then on hardware: a rising value means the NPU needs recalibration.
+    pub fn self_check(&self) -> Result<Option<f64>> {
+        self.npu
+            .as_ref()
+            .map(|(f, i)| worst_check([f, i], 1))
+            .transpose()
+    }
+
+    fn upload_to(mut self, target: Target<'_>) -> Result<Self> {
         self.npu = Some((
-            ResidentMatrix::upload(npu, &self.forward, 64, 64)?,
-            ResidentMatrix::upload(npu, &self.inverse, 64, 64)?,
+            ResidentMatrix::upload(target, &self.forward, 64, 64)?,
+            ResidentMatrix::upload(target, &self.inverse, 64, 64)?,
         ));
         Ok(self)
     }
