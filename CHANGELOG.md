@@ -27,6 +27,13 @@ official toolkit v2.4.0.
   on `qanten::compute` (covariance via `gemm`, resident `NpuMatrix` scoring,
   daily `check_product` NPU self-check); a cavitation fault the classifier
   never sees; two new features (band energy, envelope floor).
+- Neural fields: `nn::FourierFeatures` (fixed `[cos 2πBx, sin 2πBx]`, phases
+  in f64 on the host, cos/sin on the NPU, `encode` for f32 coordinates),
+  `nn::Sine` and `train::Sine::on_npu` (SIREN's sine and its derivative on
+  the NPU), `train::FourierFeatures` with an input gradient,
+  `train::Dense::siren` initialisation, `train::siren` builder, and
+  `nn::Sequential::load_siren`. Example `neural_fields` (image and SDF
+  fitting, marching squares).
 - `qanten-graphics::terrain`: procedural heightfields from an fBm-like
   plane-wave spectrum. A tile-local angle-sum split keeps one table resident
   for every tile, so many tiles go in one NPU call. Exact `height_at` /

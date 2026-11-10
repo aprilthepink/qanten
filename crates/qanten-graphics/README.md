@@ -57,6 +57,7 @@ cargo run --release -p qanten-graphics --example dct      # JPEG-style compressi
 cargo run --release -p qanten-graphics --features gltf --example gltf  # animated glTF model
 cargo run --release -p qanten-graphics --example terrain  # 9 terrain tiles in one call
 cargo run --release -p qanten-graphics --example filters  # bloom, mips, edges, normal map
+cargo run --release -p qanten-graphics --example neural_fields  # SIREN / Fourier features trained on the NPU
 ```
 
 Each example prints NPU-path vs CPU-reference timing and the maximum error.

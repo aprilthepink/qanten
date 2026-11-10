@@ -27,11 +27,13 @@
 
 mod layers;
 mod mlp;
+mod periodic;
 mod state_dict;
 pub mod transformer;
 
 pub use layers::*;
 pub use mlp::{ActivationKind, MlpLayerInfo};
+pub use periodic::{FourierFeatures, Sine};
 pub use state_dict::StateDict;
 
 use crate::error::Result;

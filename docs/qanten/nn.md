@@ -45,6 +45,8 @@ fn main() -> qanten::Result<()> {
 | `BatchNorm2d` | `new(npu, mean, var, weight, bias, eps)` | `load(npu, sd, prefix, eps)` → `running_mean`, `running_var`, `weight`?, `bias`? |
 | `LayerNorm` | struct literal `{ weight, bias, eps }` | `load(sd, prefix, eps)` |
 | `Kan` | `new(npu, phis, ampls, ks)` | `load(npu, sd, prefix)` → `phis`, `ampls`, `ks` |
+| `FourierFeatures` | `new(npu, b)`, `gaussian(npu, features, dims, σ, seed)`; `encode(&coords)` for f32 input | `load(npu, sd, prefix)` → `b` |
+| `Sine` | `new(npu, ω₀)`: SIREN's `sin(ω₀x)` on the NPU | – (`Sequential::load_siren(npu, sd, ω₀)` loads a whole SIREN) |
 | `MaxPool2d`, `AvgPool2d` | `new(kernel)` or `MaxPool2d(Pool2dParams)` | – |
 | `AdaptiveAvgPool2d` | `new(output)` | – |
 | `Flatten` | `Flatten::default()` (from dim 1) or `{ start_dim }` | – |

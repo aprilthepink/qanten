@@ -3,19 +3,6 @@
 Planned work that is designed but not built yet. Each item has enough notes to
 start from. Ordered roughly by value.
 
-## Neural graphics (SIREN / Fourier features)
-
-- `nn::FourierFeatures { b: [m, d] }`: `[cos(2π B x), sin(2π B x)]`. The matvec
-  runs on the NPU; phases are reduced modulo 2π on the host before the
-  nonlinearity (bf16 can't hold large phases), then `periodic_nl`.
-- `nn::Sine { omega0 }` layer (SIREN): `sin(ω₀ (Wx + b))` =
-  `cos(ω₀ (Wx + b) − π/2)`, same host reduction.
-- SIREN initialisation (uniform ±√(6/n)/ω₀, first layer ±1/n).
-- Needs training (core TODO list) for backward passes: `d/dz sin(ωz) = ω cos(ωz)`,
-  also computable with `periodic_nl`.
-- Examples: fit an image (picture: target vs NPU-trained SIREN), fit a 2-D/3-D
-  SDF and mesh it with marching squares/cubes.
-
 ## Bevy plugin (`qanten-bevy` crate)
 
 - `QantenPlugin`: inserts an `Npu` resource (`Npu::from_env`), logs the backend.

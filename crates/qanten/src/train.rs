@@ -121,6 +121,33 @@ impl Dense {
         Self::from_weights(npu, weight, bias)
     }
 
+    /// SIREN initialisation (Sitzmann et al. 2020) for a layer followed by
+    /// `sin(ω₀·)`: weights uniform in `±1/in` for the first layer, `±√(6/in)/ω₀`
+    /// for the others, so pre-activations stay well spread over the sine's
+    /// period at every depth. Biases use the PyTorch default.
+    pub fn siren(
+        npu: &Npu,
+        n_in: usize,
+        n_out: usize,
+        omega0: f32,
+        first: bool,
+        seed: u64,
+    ) -> Result<Self> {
+        let n = n_in.max(1) as f32;
+        let bound = if first {
+            1.0 / n
+        } else {
+            (6.0 / n).sqrt() / omega0
+        };
+        let bias_bound = 1.0 / n.sqrt();
+        let mut rng = SplitMix64::new(seed);
+        let weight = Matrix::from_fn(n_out, n_in, |_, _| rng.uniform(-bound, bound));
+        let bias = (0..n_out)
+            .map(|_| rng.uniform(-bias_bound, bias_bound))
+            .collect();
+        Self::from_weights(npu, weight, bias)
+    }
+
     /// From existing f32 weights `[out, in]` and bias `[out]`.
     pub fn from_weights(npu: &Npu, weight: Matrix, bias: Vec<f32>) -> Result<Self> {
         let (n_out, n_in) = weight.shape();
@@ -436,20 +463,45 @@ activation!(
     Sigmoid, |x| 1.0 / (1.0 + (-x).exp()), |y, _x| y * (1.0 - y)
 );
 
-/// `sin(ω₀·x)` (the SIREN activation), computed on the host.
+/// `sin(ω₀·x)`, the SIREN activation. With [`Sine::on_npu`] the forward
+/// sine and the backward `ω₀·cos(ω₀·x)` both run on the NPU's periodic
+/// nonlinearity (phases reduced on the host); [`Sine::new`] computes them on
+/// the host.
 #[derive(Debug)]
 pub struct Sine {
-    /// Frequency `ω₀` (SIREN uses 30 for the first layer).
+    /// Frequency `ω₀` (SIREN uses 30).
     pub omega0: f32,
+    npu: Option<Npu>,
     input: Option<Vec<f32>>,
 }
 
 impl Sine {
-    /// `sin(omega0 · x)`.
+    /// `sin(omega0 · x)` on the host.
     pub fn new(omega0: f32) -> Self {
         Self {
             omega0,
+            npu: None,
             input: None,
+        }
+    }
+
+    /// `sin(omega0 · x)` on `npu`.
+    pub fn on_npu(npu: &Npu, omega0: f32) -> Self {
+        Self {
+            omega0,
+            npu: Some(npu.clone()),
+            input: None,
+        }
+    }
+
+    /// `sin` or `cos` of `ω₀·x` for every value, on the NPU if attached.
+    fn periodic(&self, xs: &[f32], cos: bool) -> Result<Vec<f32>> {
+        let t: Vec<f32> = xs.iter().map(|v| self.omega0 * v).collect();
+        match (&self.npu, cos) {
+            (Some(npu), true) => npu.cos(&t),
+            (Some(npu), false) => npu.sin(&t),
+            (None, true) => Ok(t.iter().map(|v| v.cos()).collect()),
+            (None, false) => Ok(t.iter().map(|v| v.sin()).collect()),
         }
     }
 }
@@ -457,18 +509,19 @@ impl Sine {
 impl Layer for Sine {
     fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
         let xs = x.to_f32_vec();
-        let ys: Vec<f32> = xs.iter().map(|v| (self.omega0 * v).sin()).collect();
+        let ys = self.periodic(&xs, false)?;
         self.input = Some(xs);
         Tensor::from_f32(&ys, x.shape().to_vec())
     }
 
     fn backward(&mut self, grad: &Tensor) -> Result<Tensor> {
         let xs = take(&mut self.input, "Sine")?;
+        let cos = self.periodic(&xs, true)?;
         let d: Vec<f32> = grad
             .to_f32_vec()
             .iter()
-            .zip(&xs)
-            .map(|(g, x)| g * self.omega0 * (self.omega0 * x).cos())
+            .zip(&cos)
+            .map(|(g, c)| g * self.omega0 * c)
             .collect();
         Tensor::from_f32(&d, grad.shape().to_vec())
     }
@@ -476,6 +529,100 @@ impl Layer for Sine {
     fn name(&self) -> &'static str {
         "Sine"
     }
+}
+
+/// Fixed random Fourier features `[cos(2π B x), sin(2π B x)]` as a training
+/// layer (no parameters; `B` is exported as the buffer `b`). The input
+/// gradient `2π·Bᵀ·(g_sin·cos − g_cos·sin)` lets it sit after trainable
+/// layers too. As the first layer, encoding the dataset once with
+/// [`nn::FourierFeatures::encode`](crate::nn::FourierFeatures::encode) is
+/// cheaper and keeps the coordinates in f32.
+#[derive(Debug)]
+pub struct FourierFeatures {
+    inner: crate::nn::FourierFeatures,
+    /// `(cos, sin)` of the last forward pass, `[batch, features]` each.
+    saved: Option<(Vec<f32>, Vec<f32>)>,
+}
+
+impl FourierFeatures {
+    /// Wraps fixed features (see [`nn::FourierFeatures::gaussian`](crate::nn::FourierFeatures::gaussian)).
+    pub fn new(features: crate::nn::FourierFeatures) -> Self {
+        Self {
+            inner: features,
+            saved: None,
+        }
+    }
+}
+
+impl Layer for FourierFeatures {
+    fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
+        let y = self.inner.encode(&Matrix::from_tensor(x)?)?;
+        let m = self.inner.matrix().rows();
+        let (mut c, mut s) = (Vec::new(), Vec::new());
+        for row in y.iter_rows() {
+            c.extend_from_slice(&row[..m]);
+            s.extend_from_slice(&row[m..]);
+        }
+        self.saved = Some((c, s));
+        y.to_tensor()
+    }
+
+    fn backward(&mut self, grad: &Tensor) -> Result<Tensor> {
+        let (c, s) = take(&mut self.saved, "FourierFeatures")?;
+        let g = Matrix::from_tensor(grad)?;
+        let b = self.inner.matrix();
+        let m = b.rows();
+        ensure_shape!(
+            g.cols() == 2 * m,
+            "FourierFeatures: gradient has {} columns, expected {}",
+            g.cols(),
+            2 * m
+        );
+        // ∂y_cos/∂phase = −sin, ∂y_sin/∂phase = cos, ∂phase/∂x = 2π·B.
+        let tau = std::f32::consts::TAU;
+        let dphase = Matrix::from_fn(g.rows(), m, |r, k| {
+            tau * (g[(r, m + k)] * c[r * m + k] - g[(r, k)] * s[r * m + k])
+        });
+        dphase.matmul(b)?.to_tensor()
+    }
+
+    fn buffers(&self) -> Vec<(&'static str, Tensor)> {
+        self.inner
+            .matrix()
+            .to_tensor()
+            .map(|t| vec![("b", t)])
+            .unwrap_or_default()
+    }
+
+    fn name(&self) -> &'static str {
+        "FourierFeatures"
+    }
+}
+
+/// A SIREN: `sizes = [in, hidden…, out]`, every hidden layer `Dense` with
+/// [SIREN initialisation](Dense::siren) followed by an NPU [`Sine`], and a
+/// linear output layer. Save it with [`Model::state_dict`] and load it for
+/// inference with [`nn::Sequential::load_siren`](crate::nn::Sequential::load_siren).
+pub fn siren(npu: &Npu, sizes: &[usize], omega0: f32, seed: u64) -> Result<Model> {
+    if sizes.len() < 2 {
+        return Err(Error::InvalidArgument(
+            "a SIREN needs at least an input and an output size".into(),
+        ));
+    }
+    let mut model = Model::new();
+    let last = sizes.len() - 2;
+    for (k, pair) in sizes.windows(2).enumerate() {
+        let seed = seed.wrapping_add(k as u64);
+        if k == last {
+            // The output layer is linear; it uses the hidden-layer bound.
+            model = model.add(Dense::siren(npu, pair[0], pair[1], omega0, false, seed)?);
+        } else {
+            model = model
+                .add(Dense::siren(npu, pair[0], pair[1], omega0, k == 0, seed)?)
+                .add(Sine::on_npu(npu, omega0));
+        }
+    }
+    Ok(model)
 }
 
 /// Layers applied in order, trained together.
