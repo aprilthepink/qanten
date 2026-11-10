@@ -2,6 +2,7 @@
 name = "qanten-mock-driver"
 description = "Test-only stand-in for libqant_native_computing_driver, backed by the qanten simulator"
 version.workspace = true
+authors.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false

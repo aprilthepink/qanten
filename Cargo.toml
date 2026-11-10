@@ -10,8 +10,8 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/aprilthepink/qanten"
-authors = ["qanten contributors"]
-keywords = ["qanten", "qant", "photonic", "npu", "neural-network"]
+authors = ["aprl <aprl@acab.dev>"]
+keywords = ["qanten", "photonic", "npu", "neural-network"]
 categories = ["hardware-support", "science", "api-bindings"]
 
 [workspace.dependencies]

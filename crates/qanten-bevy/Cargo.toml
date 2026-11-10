@@ -6,7 +6,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/aprilthepink/qanten"
-authors = ["qanten contributors"]
+authors = ["aprl <aprl@acab.dev>"]
 keywords = ["qanten", "bevy", "gamedev", "photonic", "npu"]
 categories = ["game-development", "hardware-support"]
 # Not in the first crates.io release (see TODO.md / RELEASING.md).

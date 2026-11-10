@@ -8,7 +8,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-keywords = ["qanten", "qant", "inference", "server", "npu"]
+keywords = ["qanten", "inference", "server", "npu"]
 categories = ["web-programming::http-server", "science", "hardware-support"]
 
 [[bin]]

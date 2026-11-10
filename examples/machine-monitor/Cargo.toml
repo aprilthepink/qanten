@@ -2,6 +2,7 @@
 name = "machine-monitor"
 description = "Example project: vibration-based predictive maintenance on Q.ANT NPUs"
 version = "0.1.0"
+authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

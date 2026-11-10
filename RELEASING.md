@@ -52,10 +52,7 @@ so a broken release is fixed with a new patch version.
 
 ## Before the first release
 
-These need a decision from the maintainers and are not automated:
+Not automated:
 
-- `authors` in `workspace.package` is still the placeholder `qanten contributors`.
-- The names use "qant"/"Q.ANT", a company's name: decide whether that is acceptable
-  for crates on crates.io or ask Q.ANT (the README says the project is unofficial).
 - Run `qanten selftest` and the examples on real hardware if at all possible: so far
   everything is tested on the simulator and a mock driver (see `docs/testing.md`).
