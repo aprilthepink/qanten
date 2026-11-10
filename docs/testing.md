@@ -7,6 +7,7 @@
 | Unit and op tests | every op against a plain f32 reference, on the simulator | `cargo test --workspace --all-features` |
 | Graphics accuracy tests | each NPU formulation against its CPU path | included in the command above |
 | FFI path | the real `dlopen` + C ABI, through a mock driver | see below |
+| Bevy plugins | headless app with `MinimalPlugins`, windowed example type-checks | `scripts/ci-bevy.sh` (separate workspace) |
 | Hardware | the actual card | `qanten selftest`, examples |
 
 ## The mock driver

@@ -1,4 +1,5 @@
 /target
+/crates/qanten-bevy/target
 **/*.rs.bk
 .DS_Store
 /model.safetensors

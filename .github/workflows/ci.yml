@@ -43,11 +43,38 @@ jobs:
           cargo run --release -p qanten-graphics --example probes -- probes.png
           cargo run --release -p qanten-graphics --example blendshapes -- blendshapes.png
           cargo run --release -p qanten-graphics --example dct -- dct.png
+          cargo run --release -p qanten-graphics --example terrain -- terrain.png
+          cargo run --release -p qanten-graphics --example filters -- filters.png
+          cargo run --release -p qanten-graphics --features gltf --example gltf -- crates/qanten-graphics/tests/data/gltf/tentacle.glb gltf.png
+          cargo run --release -p qanten-graphics --example neural_fields -- neural_fields.png 20
       - name: Doc snippets compile and run
         run: python3 scripts/check_docs.py
       - run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # qanten-bevy is its own workspace: Bevy takes several minutes and ~2 GB to
+  # build, so it runs here instead of in the jobs above.
+  bevy:
+    name: qanten-bevy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/qanten-bevy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: System libraries for Bevy's windowed build
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/qanten-bevy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --features gltf
+      - run: cargo test --features gltf
+      - run: cargo check --features windowed --example ocean
 
   msrv:
     runs-on: ubuntu-latest

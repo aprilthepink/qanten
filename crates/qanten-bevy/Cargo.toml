@@ -1,0 +1,51 @@
+[package]
+name = "qanten-bevy"
+description = "Bevy plugins for qanten-graphics: NPU oceans with buoyancy, skinned colliders, light-probe baking"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/aprilthepink/qanten"
+authors = ["qanten contributors"]
+keywords = ["qanten", "bevy", "gamedev", "photonic", "npu"]
+categories = ["game-development", "hardware-support"]
+# Not in the first crates.io release (see TODO.md / RELEASING.md).
+publish = false
+
+# A workspace of its own: Bevy is a large build (several minutes, ~2 GB of
+# target dir), so it stays out of the main workspace and its default CI job.
+[workspace]
+
+[dependencies]
+qanten = { path = "../qanten", version = "0.1.0" }
+qanten-graphics = { path = "../qanten-graphics", version = "0.1.0" }
+# Bevy 0.17 is the newest release that builds with Rust 1.88 (the workspace MSRV).
+bevy = { version = "0.17", default-features = false, features = [
+    "std",
+    "bevy_asset",
+    "bevy_mesh",
+    "bevy_image",
+    "bevy_log",
+] }
+
+# Texture types for `ProbeBaker::to_image`; the same version Bevy 0.17 uses
+# (bevy_image does not re-export them without bevy_render).
+wgpu-types = { version = "26", default-features = false }
+
+[features]
+## Loading skinned colliders from glTF (`NpuSkinnedCollider::from_gltf`).
+gltf = ["qanten-graphics/gltf"]
+## Full Bevy (windowing, rendering) for the windowed example.
+windowed = ["bevy/default"]
+
+[[example]]
+name = "ocean"
+required-features = ["windowed"]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+mem_forget = "deny"
+undocumented_unsafe_blocks = "warn"

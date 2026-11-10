@@ -115,3 +115,8 @@ cargo run --release -p qanten-graphics --example dct          # dct.png
 
 They use the hardware when the driver is installed and the simulator otherwise. The
 images are drawn by a small software rasterizer in `examples/common`.
+
+## Using it from Bevy
+
+[`qanten-bevy`](bevy.md) wraps the ocean, skinning and probe baking as Bevy plugins and
+components.

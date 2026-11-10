@@ -1,5 +1,7 @@
 [workspace]
 resolver = "3"
+# qanten-bevy is a separate workspace (Bevy is a large build); see its Cargo.toml.
+exclude = ["crates/qanten-bevy"]
 members = ["crates/qanten-sys", "crates/qanten", "crates/qanten-cli", "crates/qanten-graphics", "crates/qanten-serve", "crates/qanten-mock-driver", "examples/machine-monitor"]
 
 [workspace.package]

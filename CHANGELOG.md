@@ -27,6 +27,12 @@ official toolkit v2.4.0.
   on `qanten::compute` (covariance via `gemm`, resident `NpuMatrix` scoring,
   daily `check_product` NPU self-check); a cavitation fault the classifier
   never sees; two new features (band energy, envelope floor).
+- `qanten-bevy` (separate workspace, Bevy 0.17): `QantenPlugin` (NPU
+  resource), `OceanPlugin` + `Ocean` (mesh updated on the NPU every frame) +
+  `Buoyancy`, `SkinnedColliderPlugin` + `NpuSkinnedCollider` (CPU skinned
+  copies from Bevy joints, one NPU call per shared mesh, `ray_cast`,
+  `from_gltf`), `ProbeBaker` (SH9 probe volumes into a 3-D image). Headless
+  tests, windowed example, separate CI job and `scripts/ci-bevy.sh`.
 - Neural fields: `nn::FourierFeatures` (fixed `[cos 2πBx, sin 2πBx]`, phases
   in f64 on the host, cos/sin on the NPU, `encode` for f32 coordinates),
   `nn::Sine` and `train::Sine::on_npu` (SIREN's sine and its derivative on
