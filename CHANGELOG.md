@@ -27,6 +27,14 @@ official toolkit v2.4.0.
   on `qanten::compute` (covariance via `gemm`, resident `NpuMatrix` scoring,
   daily `check_product` NPU self-check); a cavitation fault the classifier
   never sees; two new features (band energy, envelope floor).
+- `qanten-graphics::terrain`: procedural heightfields from an fBm-like
+  plane-wave spectrum. A tile-local angle-sum split keeps one table resident
+  for every tile, so many tiles go in one NPU call. Exact `height_at` /
+  `normal_at`, slope masks. Example `terrain`, guide `docs/graphics/terrain.md`.
+- `qanten-graphics::filters`: separable Gaussian blur and 2× downsampling
+  (two NPU calls per image for any number of channels), multi-scale bloom
+  (two calls for any number of radii), 3×3 stencils (Sobel, sharpen) with
+  `edges` and `normal_map`. Example `filters`, guide `docs/graphics/filters.md`.
 - `qanten-graphics` feature `gltf`: `gltf::GltfScene` loads `.gltf` / `.glb`
   meshes, skins (`SkinnedMesh` + joints + inverse bind matrices), morph targets
   (`Blendshapes`) and animation clips (STEP, LINEAR, CUBICSPLINE) sampled into

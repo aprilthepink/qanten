@@ -43,6 +43,11 @@ impl MatrixOp {
         Ok(())
     }
 
+    /// Rows of the matrix (outputs per input vector).
+    pub(crate) fn rows(&self) -> usize {
+        self.host.rows()
+    }
+
     pub(crate) fn is_accelerated(&self) -> bool {
         self.resident.is_some()
     }

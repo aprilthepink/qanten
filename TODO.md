@@ -3,20 +3,6 @@
 Planned work that is designed but not built yet. Each item has enough notes to
 start from. Ordered roughly by value.
 
-## More graphics workloads (`qanten-graphics`)
-
-- **Procedural terrain** (`terrain` module): heightfields from a sum of plane
-  waves with a power-law spectrum (fBm-like), using the same separable
-  angle-sum trick as `ocean` → one matmul per tile. Outputs heights, normals,
-  slope mask; exact `height_at(x, z)` for gameplay. Static, so tiles can be
-  generated in background batches.
-- **Image filters** (`filters` module): separable Gaussian blur as two banded
-  matrix products (rows, then columns), bloom (threshold + multi-scale blur),
-  Sobel/edge detection and sharpen via `ops::conv2d`. Useful in texture
-  pipelines (mip generation, normal-map from height).
-- Examples + pictures for both, guides in `docs/graphics/`.
-- Not a good fit (sparse, branchy): cloth/soft-body springs, BVH building.
-
 ## Neural graphics (SIREN / Fourier features)
 
 - `nn::FourierFeatures { b: [m, d] }`: `[cos(2π B x), sin(2π B x)]`. The matvec

@@ -19,6 +19,8 @@ matrix kept resident on the NPU, so each frame only moves small inputs.
 | `blendshapes` | morph targets for crowds | resident `[3·vertices, shapes]` × per-character weights |
 | `sh` | light-probe baking to SH9, irradiance for many normals | resident `[9, samples]` basis × radiance rows |
 | `dct` | 8×8 block DCT / inverse for image and texture pipelines | resident 64×64 Kronecker matrix × all blocks |
+| `terrain` | procedural fBm-like heightfields in tiles; exact height queries, slope masks | tile-local angle-sum split → resident `[Nx, 2W]` table × `3·Nz` rows per tile, many tiles per call |
+| `filters` | Gaussian blur, mip downsampling, bloom, Sobel, sharpen, normal maps | resident banded matrices (two calls per image, any number of channels / bloom radii); im2row stencils |
 
 With the `gltf` feature, `gltf::GltfScene` loads `.gltf` / `.glb` meshes, skins, morph
 targets and animation clips (STEP, LINEAR, CUBICSPLINE) into `SkinnedMesh` and
@@ -53,6 +55,8 @@ cargo run --release -p qanten-graphics --example blendshapes  # morph targets
 cargo run --release -p qanten-graphics --example probes   # bakes 1024 light probes
 cargo run --release -p qanten-graphics --example dct      # JPEG-style compression
 cargo run --release -p qanten-graphics --features gltf --example gltf  # animated glTF model
+cargo run --release -p qanten-graphics --example terrain  # 9 terrain tiles in one call
+cargo run --release -p qanten-graphics --example filters  # bloom, mips, edges, normal map
 ```
 
 Each example prints NPU-path vs CPU-reference timing and the maximum error.

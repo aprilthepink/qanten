@@ -13,6 +13,8 @@
 //! | [`skinning`] | linear blend skinning on the CPU (collision, picking, cloth) | resident `[vertices, 4·bones]` matrix × bone matrices |
 //! | [`sh`] | light-probe baking into spherical harmonics, irradiance | resident basis × radiance samples |
 //! | [`dct`] | 8×8 block DCT for texture / image pipelines | resident 64×64 Kronecker matrix × blocks |
+//! | [`terrain`] | procedural heightfields (fBm-like plane-wave spectrum), normals, slope masks | tile-local angle-sum split → one matmul for many tiles |
+//! | [`filters`] | Gaussian blur, mip downsampling, bloom, Sobel, sharpen, normal maps | resident banded matrices (two calls per image), im2row stencils |
 //!
 //! With the `gltf` feature, `gltf::GltfScene` loads meshes, skins, morph
 //! targets and animations from `.gltf` / `.glb` files into these types.
@@ -43,11 +45,13 @@
 mod accel;
 pub mod blendshapes;
 pub mod dct;
+pub mod filters;
 #[cfg(feature = "gltf")]
 pub mod gltf;
 pub mod ocean;
 pub mod sh;
 pub mod skinning;
+pub mod terrain;
 
 pub use glam;
 pub use qanten::{Error, Npu, Result};
