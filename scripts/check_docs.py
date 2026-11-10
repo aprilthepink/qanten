@@ -26,7 +26,7 @@ publish = false
 [dependencies]
 qanten = {{ path = "{ROOT}/crates/qanten", features = ["full"] }}
 qanten-sys = {{ path = "{ROOT}/crates/qanten-sys" }}
-qanten-graphics = {{ path = "{ROOT}/crates/qanten-graphics" }}
+qanten-graphics = {{ path = "{ROOT}/crates/qanten-graphics", features = ["gltf"] }}
 tracing = "0.1"
 
 [workspace]

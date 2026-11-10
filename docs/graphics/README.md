@@ -10,7 +10,7 @@ product. The big, constant matrix stays on the NPU, so each frame only moves sma
 | | | |
 |---|---|---|
 | ![](../images/ocean.png) [Ocean waves](ocean.md) | ![](../images/crowd.png) [Skinning](skinning.md) | ![](../images/blendshapes.png) [Blendshapes](blendshapes.md) |
-| ![](../images/probes.png) [Light probes](sh.md) | ![](../images/dct.png) [Block DCT](dct.md) | |
+| ![](../images/probes.png) [Light probes](sh.md) | ![](../images/dct.png) [Block DCT](dct.md) | ![](../images/gltf.png) [Loading glTF](gltf.md) |
 
 ## The pattern every module follows
 

@@ -14,6 +14,9 @@
 //! | [`sh`] | light-probe baking into spherical harmonics, irradiance | resident basis × radiance samples |
 //! | [`dct`] | 8×8 block DCT for texture / image pipelines | resident 64×64 Kronecker matrix × blocks |
 //!
+//! With the `gltf` feature, `gltf::GltfScene` loads meshes, skins, morph
+//! targets and animations from `.gltf` / `.glb` files into these types.
+//!
 //! Every type works without an NPU (plain CPU path) and switches to the NPU
 //! with `.with_npu(&npu)`, or to several NPUs with `.with_pool(&pool)` (a
 //! full copy on each, batches split between them). `.self_check()` measures
@@ -40,6 +43,8 @@
 mod accel;
 pub mod blendshapes;
 pub mod dct;
+#[cfg(feature = "gltf")]
+pub mod gltf;
 pub mod ocean;
 pub mod sh;
 pub mod skinning;

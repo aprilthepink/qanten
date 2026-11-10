@@ -56,6 +56,10 @@ fn main() -> qanten::Result<()> {
 Bone matrices are the usual skinning matrices: the bone's animated world transform
 times its inverse bind matrix.
 
+To load the mesh, influences, skeleton and animations from a `.gltf` / `.glb` file, use
+[`GltfScene::skinned_mesh`](gltf.md) (feature `gltf`):
+`clip.skinning_matrices(&model.skin, t)` produces exactly these matrices.
+
 ## How it maps to the NPU
 
 LBS is `v' = Σ_b w_vb · M_b · (v, 1)`. Rewritten as an offset from the rest pose,

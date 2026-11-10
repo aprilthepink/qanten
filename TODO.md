@@ -3,24 +3,6 @@
 Planned work that is designed but not built yet. Each item has enough notes to
 start from. Ordered roughly by value.
 
-## glTF loading (`qanten-graphics`, feature `gltf`)
-
-Load `.gltf` / `.glb` straight into the graphics types.
-
-- Meshes: positions, normals, indices (all primitives of a mesh, merged).
-- Skins: `JOINTS_0` / `WEIGHTS_0` → `skinning::Influences`, joint list, inverse
-  bind matrices → `SkinnedMesh`.
-- Morph targets: `targets[*].POSITION` (already offsets in glTF) → `Blendshapes`;
-  default weights from `mesh.weights`.
-- Skeleton + animation: node hierarchy, `animations[*].channels` (translation,
-  rotation, scale; LINEAR and STEP; CUBICSPLINE later). API sketch:
-  `GltfScene::load(path)`, `scene.skinned_mesh(i)`, `scene.blendshapes(i)`,
-  `scene.animation("Walk").skinning_matrices(skin, t) -> Vec<Mat4>`.
-- Crate: `gltf` (check MSRV ≤ 1.88). Tests need small assets: generate them with
-  a script (JSON + base64 buffer) rather than downloading Khronos samples.
-- Docs: extend `docs/graphics/skinning.md` and `blendshapes.md`; picture of a
-  loaded, animated model rendered by the example rasterizer.
-
 ## More graphics workloads (`qanten-graphics`)
 
 - **Procedural terrain** (`terrain` module): heightfields from a sum of plane

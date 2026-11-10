@@ -15,11 +15,22 @@ categories = ["graphics", "game-development", "hardware-support"]
 qanten = { workspace = true, default-features = true }
 glam.workspace = true
 rayon.workspace = true
+gltf = { workspace = true, optional = true }
+
+[features]
+default = []
+## Load meshes, skins, morph targets and animations from .gltf / .glb files.
+gltf = ["dep:gltf"]
 
 [dev-dependencies]
 anyhow.workspace = true
 criterion.workspace = true
 png.workspace = true
+serde_json.workspace = true
+
+[[example]]
+name = "gltf"
+required-features = ["gltf"]
 
 [[bench]]
 name = "graphics"

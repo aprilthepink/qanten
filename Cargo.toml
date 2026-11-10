@@ -35,6 +35,7 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 png = "0.18"
+gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

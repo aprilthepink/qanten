@@ -33,7 +33,11 @@ fn main() -> qanten::Result<()> {
 ```
 
 Use `Blendshapes::from_target_positions(base, targets)` if your targets are absolute
-positions (as in glTF files exported from some tools) rather than offsets.
+positions rather than offsets.
+
+glTF stores morph targets as offsets already: [`GltfScene::blendshapes`](gltf.md)
+(feature `gltf`) loads them with the mesh's default weights, and animation clips give
+the animated weights (`pose.morph_weights(node)`).
 
 ## API
 

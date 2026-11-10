@@ -20,6 +20,10 @@ matrix kept resident on the NPU, so each frame only moves small inputs.
 | `sh` | light-probe baking to SH9, irradiance for many normals | resident `[9, samples]` basis × radiance rows |
 | `dct` | 8×8 block DCT / inverse for image and texture pipelines | resident 64×64 Kronecker matrix × all blocks |
 
+With the `gltf` feature, `gltf::GltfScene` loads `.gltf` / `.glb` meshes, skins, morph
+targets and animation clips (STEP, LINEAR, CUBICSPLINE) into `SkinnedMesh` and
+`Blendshapes`.
+
 Every type works on the CPU out of the box and moves to the NPU with
 `.with_npu(&npu)`, or onto several with `.with_pool(&pool)` (a copy per NPU,
 batches split between them). `.self_check()` reports the NPU's current
@@ -48,6 +52,7 @@ cargo run --release -p qanten-graphics --example crowd    # 100 skinned tentacle
 cargo run --release -p qanten-graphics --example blendshapes  # morph targets
 cargo run --release -p qanten-graphics --example probes   # bakes 1024 light probes
 cargo run --release -p qanten-graphics --example dct      # JPEG-style compression
+cargo run --release -p qanten-graphics --features gltf --example gltf  # animated glTF model
 ```
 
 Each example prints NPU-path vs CPU-reference timing and the maximum error.
