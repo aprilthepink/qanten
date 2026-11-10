@@ -27,6 +27,11 @@ official toolkit v2.4.0.
   on `qanten::compute` (covariance via `gemm`, resident `NpuMatrix` scoring,
   daily `check_product` NPU self-check); a cavitation fault the classifier
   never sees; two new features (band energy, envelope floor).
+- Release workflow: pushing a `vX.Y.Z` tag checks tag, versions and
+  CHANGELOG (`scripts/release.py`), runs CI, verifies and publishes the
+  crates to crates.io in dependency order (re-runnable), and creates a
+  GitHub release from the CHANGELOG section. See `RELEASING.md`. CI also
+  checks that the crates package.
 - `qanten-bevy` (separate workspace, Bevy 0.17): `QantenPlugin` (NPU
   resource), `OceanPlugin` + `Ocean` (mesh updated on the NPU every frame) +
   `Buoyancy`, `SkinnedColliderPlugin` + `NpuSkinnedCollider` (CPU skinned

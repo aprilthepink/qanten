@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release workflow runs the full CI before publishing.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -52,6 +54,11 @@ jobs:
       - run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      # Catches packaging problems (missing files, bad metadata) before a
+      # release. Full verification needs a fresh target dir, so the release
+      # workflow does that.
+      - name: Crates package
+        run: cargo package -p qanten-sys -p qanten -p qanten-graphics -p qanten-serve -p qanten-cli --no-verify --locked
 
   # qanten-bevy is its own workspace: Bevy takes several minutes and ~2 GB to
   # build, so it runs here instead of in the jobs above.

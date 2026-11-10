@@ -1,0 +1,61 @@
+name: Release
+
+# Pushing a tag `vX.Y.Z` runs the full CI, checks that the tag, versions and
+# CHANGELOG agree, publishes the crates to crates.io in dependency order and
+# creates a GitHub release with the CHANGELOG section as notes.
+# Needs the repository secret CARGO_REGISTRY_TOKEN. See RELEASING.md.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: tag, versions and CHANGELOG agree
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: echo "version=$(python3 scripts/release.py check "$GITHUB_REF_NAME")" >> "$GITHUB_OUTPUT"
+
+  ci:
+    needs: check
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: [check, ci]
+    runs-on: ubuntu-latest
+    # Optional: protect this environment in the repository settings to
+    # require an approval before anything is uploaded.
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # A fresh target dir (no cache): packages are verified against the
+      # just-packaged versions of their dependencies.
+      - name: Package and verify every crate
+        run: cargo publish --workspace --dry-run --locked
+      - name: Publish to crates.io
+        run: python3 scripts/release.py publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  github-release:
+    needs: [check, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          python3 scripts/release.py notes "$VERSION" > notes.md
+          gh release create "$GITHUB_REF_NAME" --title "qanten $VERSION" --notes-file notes.md --verify-tag

@@ -197,6 +197,8 @@ been tested against the mock driver, **not yet on Q.ANT hardware**. Reports
 from people with hardware are very welcome, especially `qanten selftest` and
 `qanten bench` output.
 
+Releases are cut from tags; see [RELEASING.md](RELEASING.md).
+
 ## License
 
 Apache-2.0, the same as Q.ANT's toolkit. See [LICENSE](LICENSE) and
