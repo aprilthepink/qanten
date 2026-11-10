@@ -113,6 +113,10 @@ mod st {
     use super::*;
 
     fn convert(name: &str, view: &TensorView<'_>) -> Result<Tensor> {
+        // The header's shape is untrusted: `[0, 2^40]` holds no data but
+        // would make layers built from it allocate terabytes.
+        crate::limits::elements(view.shape())
+            .map_err(|e| Error::Format(format!("tensor `{name}`: {e}")))?;
         let bytes = view.data();
         macro_rules! decode {
             ($ty:ty, $n:expr, $conv:expr) => {

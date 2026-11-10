@@ -23,18 +23,20 @@
 //! operators fail at load time with a clear message. Models must be
 //! self-contained (no external data files).
 
+mod batching;
 mod proto;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::device::Npu;
 use crate::error::{Error, Result};
 use crate::limits;
 use crate::nn::Module;
 use crate::ops::{
-    self, Conv2dParams, ConvTranspose2dParams, ConvTransposeWeights, ConvWeights, LinearWeights,
+    self, Conv2dParams, ConvTranspose2dParams, ConvTransposeWeights, ConvWeights, Hw, LinearWeights,
 };
 use crate::tensor::Tensor;
 use proto::{Node, TensorProto, dtype};
@@ -172,6 +174,76 @@ impl Val {
     }
 }
 
+impl Val {
+    fn data_len(&self) -> usize {
+        match self {
+            Val::F(a) => a.data.len(),
+            Val::I(d, _) => d.len(),
+        }
+    }
+    fn bytes(&self) -> usize {
+        match self {
+            Val::F(a) => a.data.len() * size_of::<f32>(),
+            Val::I(d, _) => d.len() * size_of::<i64>(),
+        }
+    }
+}
+
+/// Checks a value against the size limits and that its data matches its
+/// shape; a mismatch would make later ops index out of bounds.
+fn check_value(v: &Val) -> std::result::Result<(), String> {
+    let n = limits::elements(v.shape()).map_err(|e| e.to_string())?;
+    if n != v.data_len() {
+        return Err(format!("{} values for shape {:?}", v.data_len(), v.shape()));
+    }
+    Ok(())
+}
+
+/// The values visible to one evaluation: the model's constants (borrowed,
+/// never copied) and the values computed so far, within a memory budget.
+struct Env<'a> {
+    consts: &'a HashMap<String, Val>,
+    live: HashMap<String, Val>,
+    live_bytes: usize,
+}
+
+impl<'a> Env<'a> {
+    fn new(consts: &'a HashMap<String, Val>) -> Self {
+        Self {
+            consts,
+            live: HashMap::new(),
+            live_bytes: 0,
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&Val> {
+        self.live.get(name).or_else(|| self.consts.get(name))
+    }
+
+    fn insert(&mut self, name: String, v: Val) -> Result<()> {
+        self.remove(&name);
+        let bytes = v.bytes();
+        self.live_bytes = self
+            .live_bytes
+            .checked_add(bytes)
+            .filter(|&b| b <= limits::MAX_LIVE_BYTES)
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "evaluation would keep more than {} bytes alive",
+                    limits::MAX_LIVE_BYTES
+                ))
+            })?;
+        self.live.insert(name, v);
+        Ok(())
+    }
+
+    fn remove(&mut self, name: &str) {
+        if let Some(old) = self.live.remove(name) {
+            self.live_bytes -= old.bytes();
+        }
+    }
+}
+
 /// An input or output value of an ONNX model.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OnnxValue {
@@ -224,6 +296,16 @@ fn strides(shape: &[usize]) -> Vec<usize> {
         s[i] = s[i + 1] * shape[i + 1];
     }
     s
+}
+
+/// ONNX requires the axes of Squeeze, Unsqueeze and Slice to be distinct;
+/// repeated ones would index past the shape built so far.
+fn unique_axes(n: &Node, axes: &[usize]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    match axes.iter().find(|&&a| !seen.insert(a)) {
+        Some(a) => Err(bad(n, format!("axis {a} is repeated"))),
+        None => Ok(()),
+    }
 }
 
 fn axis(a: i64, rank: usize) -> Result<usize> {
@@ -385,13 +467,35 @@ pub struct OnnxModel {
 }
 
 fn tensor_to_val(t: &TensorProto) -> Result<Val> {
-    let data = t.to_f64()?;
     let shape = t.shape()?;
     Ok(if t.is_integer() {
-        Val::I(data.iter().map(|&v| v as i64).collect(), shape)
+        Val::I(t.to_i64()?, shape)
     } else {
-        Val::F(Arr::new(data.iter().map(|&v| v as f32).collect(), shape))
+        Val::F(Arr::new(
+            t.to_f64()?.iter().map(|&v| v as f32).collect(),
+            shape,
+        ))
     })
+}
+
+/// The value of a `Constant` node.
+fn constant_value(n: &Node) -> Result<Val> {
+    if let Some(t) = n.attr("value").and_then(|a| a.t.as_ref()) {
+        return tensor_to_val(t);
+    }
+    if let Some(v) = n.attr("value_float").and_then(|a| a.f) {
+        return Ok(Val::F(Arr::new(vec![v], vec![])));
+    }
+    if let Some(v) = n.attr("value_floats") {
+        return Ok(Val::F(Arr::new(v.floats.clone(), vec![v.floats.len()])));
+    }
+    if let Some(v) = n.attr("value_int").and_then(|a| a.i) {
+        return Ok(Val::I(vec![v], vec![]));
+    }
+    if let Some(v) = n.attr("value_ints") {
+        return Ok(Val::I(v.ints.clone(), vec![v.ints.len()]));
+    }
+    Err(unsupported(n, "this kind of constant"))
 }
 
 impl OnnxModel {
@@ -584,7 +688,18 @@ impl OnnxModel {
     /// Runs the model. `inputs` maps input names to values; returns every
     /// graph output in order.
     pub fn run(&self, inputs: &[(&str, OnnxValue)]) -> Result<Vec<(String, OnnxValue)>> {
-        let mut vals: HashMap<String, Val> = self.consts.clone();
+        self.run_cancellable(inputs, &AtomicBool::new(false))
+    }
+
+    /// Like [`run`](Self::run), but checks `cancel` between nodes and stops
+    /// with [`Error::Cancelled`] once it is set. Use it to stop work whose
+    /// caller has given up (for example after a request timeout).
+    pub fn run_cancellable(
+        &self,
+        inputs: &[(&str, OnnxValue)],
+        cancel: &AtomicBool,
+    ) -> Result<Vec<(String, OnnxValue)>> {
+        let mut env = Env::new(&self.consts);
         for spec in &self.inputs {
             let (_, v) = inputs
                 .iter()
@@ -598,31 +713,41 @@ impl OnnxModel {
                     t.shape().to_vec(),
                 ),
                 OnnxValue::Float(t) => Val::F(Arr::from_tensor(t)),
-                OnnxValue::Int { data, shape } => {
-                    if limits::elements(shape)? != data.len() {
-                        return Err(Error::Shape(format!(
-                            "input `{}`: {} values for shape {shape:?}",
-                            spec.name,
-                            data.len()
-                        )));
-                    }
-                    Val::I(data.clone(), shape.clone())
-                }
+                OnnxValue::Int { data, shape } => Val::I(data.clone(), shape.clone()),
             };
-            vals.insert(spec.name.clone(), v);
+            check_value(&v).map_err(|e| Error::Shape(format!("input `{}`: {e}", spec.name)))?;
+            env.insert(spec.name.clone(), v)?;
         }
+        // The last node reading each value; values are dropped after it.
+        let mut last_use: HashMap<&str, usize> = HashMap::new();
         for (i, node) in self.nodes.iter().enumerate() {
-            let outs = self.eval(i, node, &vals)?;
+            for name in &node.inputs {
+                last_use.insert(name.as_str(), i);
+            }
+        }
+        let keep = |name: &str| self.outputs.iter().any(|o| o == name);
+        for (i, node) in self.nodes.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            let outs = self.eval(i, node, &env)?;
             for (name, v) in node.outputs.iter().zip(outs) {
-                if !name.is_empty() {
-                    vals.insert(name.clone(), v);
+                check_value(&v).map_err(|e| bad(node, e))?;
+                let used_later = last_use.get(name.as_str()).is_some_and(|&j| j > i);
+                if !name.is_empty() && (used_later || keep(name)) {
+                    env.insert(name.clone(), v).map_err(|e| bad(node, e))?;
+                }
+            }
+            for name in &node.inputs {
+                if last_use.get(name.as_str()) == Some(&i) && !keep(name) {
+                    env.remove(name);
                 }
             }
         }
         self.outputs
             .iter()
             .map(|o| {
-                let v = vals
+                let v = env
                     .get(o)
                     .ok_or_else(|| Error::Format(format!("output `{o}` was never computed")))?;
                 Ok((
@@ -639,7 +764,7 @@ impl OnnxModel {
             .collect()
     }
 
-    fn eval(&self, idx: usize, n: &Node, vals: &HashMap<String, Val>) -> Result<Vec<Val>> {
+    fn eval(&self, idx: usize, n: &Node, vals: &Env<'_>) -> Result<Vec<Val>> {
         let input = |k: usize| -> Result<&Val> {
             let name = n
                 .inputs
@@ -969,10 +1094,11 @@ impl OnnxModel {
                     return Err(bad(n, "needs [N, C, spatial...]"));
                 }
                 let plane: usize = x.shape[2..].iter().product();
-                let data = x
-                    .data
-                    .chunks(plane.max(1))
-                    .map(|c| {
+                // One value per (batch, channel), also when the planes are
+                // empty: the mean of nothing is NaN, the max is -inf.
+                let data = (0..x.shape[0] * x.shape[1])
+                    .map(|g| {
+                        let c = &x.data[g * plane..(g + 1) * plane];
                         if op == "GlobalMaxPool" {
                             c.iter().copied().fold(f32::NEG_INFINITY, f32::max)
                         } else {
@@ -1071,6 +1197,7 @@ impl OnnxModel {
                     } else {
                         axes.iter().map(|&a| axis(a, r)).collect::<Result<_>>()?
                     };
+                    unique_axes(n, &drop)?;
                     if drop.iter().any(|&k| shape[k] != 1) {
                         return Err(bad(n, "can only squeeze dimensions of size 1"));
                     }
@@ -1086,6 +1213,7 @@ impl OnnxModel {
                         .iter()
                         .map(|&a| axis(a, out_rank))
                         .collect::<Result<_>>()?;
+                    unique_axes(n, &ax)?;
                     ax.sort_unstable();
                     for a in ax {
                         shape.insert(a, 1);
@@ -1190,9 +1318,14 @@ impl OnnxModel {
                         "starts, ends, axes and steps must have the same length",
                     ));
                 }
+                let axes: Vec<usize> = axes
+                    .iter()
+                    .map(|&a| axis(a, s.len()))
+                    .collect::<Result<_>>()?;
+                unique_axes(n, &axes)?;
                 let mut cur = v.clone();
                 for k in 0..k_len {
-                    let ax = axis(axes[k], s.len())?;
+                    let ax = axes[k];
                     let step = steps.as_ref().map_or(1, |st| st[k]);
                     if step <= 0 {
                         return Err(unsupported(n, "non-positive steps"));
@@ -1272,24 +1405,7 @@ impl OnnxModel {
                 let len = d.len();
                 one(Val::I(d, vec![len]))
             }
-            "Constant" => {
-                if let Some(t) = n.attr("value").and_then(|a| a.t.as_ref()) {
-                    return one(tensor_to_val(t)?);
-                }
-                if let Some(v) = n.attr("value_float").and_then(|a| a.f) {
-                    return one(Val::F(Arr::new(vec![v], vec![])));
-                }
-                if let Some(v) = n.attr("value_floats") {
-                    return one(Val::F(Arr::new(v.floats.clone(), vec![v.floats.len()])));
-                }
-                if let Some(v) = n.attr("value_int").and_then(|a| a.i) {
-                    return one(Val::I(vec![v], vec![]));
-                }
-                if let Some(v) = n.attr("value_ints") {
-                    return one(Val::I(v.ints.clone(), vec![v.ints.len()]));
-                }
-                Err(unsupported(n, "this kind of constant"))
-            }
+            "Constant" => one(constant_value(n)?),
             "ConstantOfShape" => {
                 let shape = dims(n, &ints(0)?)?;
                 let total = limits::elements(&shape)?;
@@ -1456,6 +1572,10 @@ impl OnnxModel {
         let Some(Resident::Conv(weights)) = self.resident.get(&idx) else {
             return Err(unsupported(n, "weights that are not constants in the file"));
         };
+        let [oc, icg, ..] = weights.shape();
+        let (ih, iw) = (input.shape[2], input.shape[3]);
+        let out = params.output_size(Hw::new(ih, iw), Hw::new(kh, kw))?;
+        check_conv_buffers(input.shape[0], oc, icg * kh * kw, out)?;
         let mut y = weights.forward(&input.tensor()?, &params)?;
         if let Some(b) = bias {
             y = ops::add_channel_bias(&y, &b.tensor()?)?;
@@ -1495,11 +1615,9 @@ impl OnnxModel {
         } else {
             (0, 0)
         };
-        let op = attr_pair(n, "output_padding", one_d).unwrap_or([0, 0]);
-        let op = if n.attr("output_padding").is_none() {
-            [0, 0]
-        } else {
-            op
+        let op = match n.attr("output_padding") {
+            None => [0, 0],
+            Some(_) => attr_pair(n, "output_padding", one_d)?,
         };
         let s = attr_pair(n, "strides", one_d)?;
         let d = attr_pair(n, "dilations", one_d)?;
@@ -1509,6 +1627,10 @@ impl OnnxModel {
             .output_padding((op[0], op[1]))
             .dilation((d[0], d[1]))
             .groups(group(n)?);
+        let [ic, ocg, kh, kw] = weights.shape();
+        let groups = weights.groups();
+        let out = params.output_size(Hw::new(x4.shape[2], x4.shape[3]), Hw::new(kh, kw))?;
+        check_conv_buffers(x4.shape[0], ocg * groups, ic / groups * kh * kw, out)?;
         let mut y = weights.forward(&x4.tensor()?, &params)?;
         if let Some(b) = bias {
             y = ops::add_channel_bias(&y, &b.tensor()?)?;
@@ -1708,9 +1830,13 @@ fn conv_pads(
         }
         "VALID" => Ok([0; 4]),
         mode @ ("SAME_UPPER" | "SAME_LOWER") => {
+            // Saturating: an empty input or kernel must not underflow.
             let total = |i: usize| {
                 let out = input[i].div_ceil(s[i]);
-                ((out - 1) * s[i] + (kernel[i] - 1) * d[i] + 1).saturating_sub(input[i])
+                (out.saturating_sub(1).saturating_mul(s[i]))
+                    .saturating_add(kernel[i].saturating_sub(1).saturating_mul(d[i]))
+                    .saturating_add(1)
+                    .saturating_sub(input[i])
             };
             let split = |t: usize| {
                 if mode == "SAME_UPPER" {
@@ -1725,6 +1851,15 @@ fn conv_pads(
         }
         other => Err(unsupported(n, format!("auto_pad={other}"))),
     }
+}
+
+/// Checks the output (`[batch, out_channels, out]`) and the unfolded patch
+/// matrix (`[batch · out, cols]`) of a convolution against the limits before
+/// anything is allocated: pads and strides from the file can make either huge.
+fn check_conv_buffers(batch: usize, out_channels: usize, cols: usize, out: Hw) -> Result<()> {
+    limits::elements(&[batch, out_channels, out.h, out.w])?;
+    limits::elements(&[batch, out.h, out.w, cols])?;
+    Ok(())
 }
 
 /// Symmetric pads become conv padding; asymmetric ones are applied to the input.
@@ -1755,7 +1890,10 @@ fn pool(n: &Node, x: &Arr, max: bool) -> Result<Arr> {
     let include_pad = n.attr_i("count_include_pad", 0) == 1;
     let oh = (h + p[0] + p[2]).saturating_sub(k[0]) / s[0] + 1;
     let ow = (w + p[1] + p[3]).saturating_sub(k[1]) / s[1] + 1;
-    let mut out = Vec::with_capacity(limits::elements(&[nb, c, oh, ow])?);
+    let outputs = limits::elements(&[nb, c, oh, ow])?;
+    // Cost grows with the window, not just the output: bound both.
+    limits::work("pool", &[outputs, k[0], k[1]])?;
+    let mut out = Vec::with_capacity(outputs);
     for plane in 0..nb * c {
         let src = &x4.data[plane * h * w..][..h * w];
         for oy in 0..oh {

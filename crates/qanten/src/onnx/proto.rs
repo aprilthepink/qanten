@@ -257,6 +257,36 @@ impl TensorProto {
         Ok(v)
     }
 
+    /// Integer contents. INT64 is read exactly (through f64 values above 2^53
+    /// would lose precision); narrower types fit f64 exactly.
+    pub fn to_i64(&self) -> Result<Vec<i64>> {
+        if self.data_type != dtype::INT64 || self.external {
+            return Ok(self.to_f64()?.into_iter().map(|v| v as i64).collect());
+        }
+        let n = crate::limits::elements(&self.shape()?)?;
+        let v: Vec<i64> = if self.raw.is_empty() {
+            self.ints.clone()
+        } else {
+            self.raw
+                .chunks_exact(8)
+                .map(|c| {
+                    let mut a = [0u8; 8];
+                    a.copy_from_slice(c);
+                    i64::from_le_bytes(a)
+                })
+                .collect()
+        };
+        if v.len() != n {
+            return Err(err(format!(
+                "tensor `{}`: {} values for shape {:?}",
+                self.name,
+                v.len(),
+                self.dims
+            )));
+        }
+        Ok(v)
+    }
+
     pub fn is_integer(&self) -> bool {
         matches!(
             self.data_type,
@@ -314,11 +344,20 @@ impl Node {
         let mut r = Reader::new(b);
         while let Some((n, f)) = r.next()? {
             match (n, &f) {
-                (1, Field::Bytes(s)) => nd.inputs.push(string(s)),
-                (2, Field::Bytes(s)) => nd.outputs.push(string(s)),
+                (1, Field::Bytes(s)) => {
+                    push(&mut nd.inputs, string(s), MAX_NODE_IO, "node inputs")?
+                }
+                (2, Field::Bytes(s)) => {
+                    push(&mut nd.outputs, string(s), MAX_NODE_IO, "node outputs")?
+                }
                 (3, Field::Bytes(s)) => nd.name = string(s),
                 (4, Field::Bytes(s)) => nd.op_type = string(s),
-                (5, Field::Bytes(s)) => nd.attributes.push(Attribute::decode(s)?),
+                (5, Field::Bytes(s)) => push(
+                    &mut nd.attributes,
+                    Attribute::decode(s)?,
+                    MAX_ATTRIBUTES,
+                    "node attributes",
+                )?,
                 (7, Field::Bytes(s)) => nd.domain = string(s),
                 _ => {}
             }
@@ -379,10 +418,19 @@ impl ValueInfo {
                                             let mut value = None;
                                             while let Some((dn, df)) = dr.next()? {
                                                 if let (1, Field::Varint(d)) = (dn, df) {
-                                                    value = Some(d as usize);
+                                                    // Negative or huge dims are
+                                                    // treated as unknown.
+                                                    value = usize::try_from(d as i64).ok().filter(
+                                                        |&d| d <= crate::limits::MAX_ELEMENTS,
+                                                    );
                                                 }
                                             }
-                                            v.shape.push(value);
+                                            push(
+                                                &mut v.shape,
+                                                value,
+                                                crate::limits::MAX_RANK,
+                                                "input dimensions",
+                                            )?;
                                         }
                                     }
                                     _ => {}
@@ -396,6 +444,23 @@ impl ValueInfo {
         }
         Ok(v)
     }
+}
+
+/// Most nodes (and initializers) in one graph. Each decoded node takes far
+/// more memory than its smallest encoding, so the counts are bounded.
+const MAX_NODES: usize = 1 << 20;
+/// Most inputs or outputs of one node or graph.
+const MAX_NODE_IO: usize = 1 << 16;
+/// Most attributes on one node.
+const MAX_ATTRIBUTES: usize = 1 << 12;
+
+/// Appends `item`, or fails once `v` already holds `max` items.
+fn push<T>(v: &mut Vec<T>, item: T, max: usize, what: &str) -> Result<()> {
+    if v.len() >= max {
+        return Err(err(format!("more than {max} {what}")));
+    }
+    v.push(item);
+    Ok(())
 }
 
 /// A decoded model.
@@ -443,10 +508,25 @@ impl Model {
         let mut gr = Reader::new(graph);
         while let Some((n, f)) = gr.next()? {
             match (n, f) {
-                (1, Field::Bytes(s)) => m.nodes.push(Node::decode(s)?),
-                (5, Field::Bytes(s)) => m.initializers.push(TensorProto::decode(s)?),
-                (11, Field::Bytes(s)) => m.inputs.push(ValueInfo::decode(s)?),
-                (12, Field::Bytes(s)) => m.outputs.push(ValueInfo::decode(s)?),
+                (1, Field::Bytes(s)) => push(&mut m.nodes, Node::decode(s)?, MAX_NODES, "nodes")?,
+                (5, Field::Bytes(s)) => push(
+                    &mut m.initializers,
+                    TensorProto::decode(s)?,
+                    MAX_NODES,
+                    "initializers",
+                )?,
+                (11, Field::Bytes(s)) => push(
+                    &mut m.inputs,
+                    ValueInfo::decode(s)?,
+                    MAX_NODE_IO,
+                    "graph inputs",
+                )?,
+                (12, Field::Bytes(s)) => push(
+                    &mut m.outputs,
+                    ValueInfo::decode(s)?,
+                    MAX_NODE_IO,
+                    "graph outputs",
+                )?,
                 _ => {}
             }
         }

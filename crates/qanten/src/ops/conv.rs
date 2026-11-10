@@ -80,8 +80,15 @@ impl Conv2dParams {
     pub fn output_size(&self, input: Hw, kernel: Hw) -> Result<Hw> {
         self.validate()?;
         let one = |i: usize, k: usize, p: usize, d: usize, s: usize, dim: &str| -> Result<usize> {
-            let span = d * (k.max(1) - 1) + 1;
-            let padded = i + 2 * p;
+            let overflow = || Error::Shape(format!("conv2d: {dim} size overflows"));
+            let span = d
+                .checked_mul(k.max(1) - 1)
+                .and_then(|x| x.checked_add(1))
+                .ok_or_else(overflow)?;
+            let padded = p
+                .checked_mul(2)
+                .and_then(|x| x.checked_add(i))
+                .ok_or_else(overflow)?;
             ensure_shape!(
                 k > 0 && padded >= span,
                 "conv2d: kernel {dim} {k} (dilated span {span}) is larger than the padded input {dim} {padded}"
@@ -184,15 +191,18 @@ impl ConvTranspose2dParams {
                     "output_padding ({op}) must be smaller than stride ({s}) or dilation ({d})"
                 )));
             }
-            let size = (i as i64 - 1) * s as i64 - 2 * p as i64
-                + d as i64 * (k as i64 - 1)
-                + op as i64
+            // i128 cannot overflow for usize inputs of this size.
+            let size = (i as i128 - 1) * s as i128 - 2 * p as i128
+                + d as i128 * (k as i128 - 1)
+                + op as i128
                 + 1;
             ensure_shape!(
                 i > 0 && k > 0 && size > 0,
                 "conv_transpose2d: computed output size {size} is not positive"
             );
-            Ok(size as usize)
+            usize::try_from(size).map_err(|_| {
+                Error::Shape(format!("conv_transpose2d: output size {size} overflows"))
+            })
         };
         Ok(Hw {
             h: one(
@@ -276,8 +286,10 @@ impl ConvWeights {
         );
         let out = params.output_size(Hw::new(h, w), Hw::new(kh, kw))?;
         let ocg = oc / groups;
-        let positions = out.h * out.w;
-        let mut result = vec![bf16::ZERO; n * oc * positions];
+        let positions = buffer_len(&[out.h, out.w])?;
+        // The output and one group's unfolded patches.
+        let mut result = vec![bf16::ZERO; buffer_len(&[n, oc, positions])?];
+        buffer_len(&[n, positions, icg, kh, kw])?;
         for (g, weights) in self.per_group.iter().enumerate() {
             let patches = im2row(
                 x.data(),
@@ -360,8 +372,10 @@ impl ConvTransposeWeights {
         let icg = ic / groups;
         let oc = ocg * groups;
         let out = params.output_size(Hw::new(h, w), Hw::new(kh, kw))?;
-        let positions = out.h * out.w;
-        let mut result = vec![bf16::ZERO; n * oc * positions];
+        let positions = buffer_len(&[out.h, out.w])?;
+        // The output and one group's unfolded patches.
+        let mut result = vec![bf16::ZERO; buffer_len(&[n, oc, positions])?];
+        buffer_len(&[n, positions, icg, kh, kw])?;
         for (g, weights) in self.per_group.iter().enumerate() {
             let patches = im2row_transpose(
                 x.data(),
@@ -527,4 +541,12 @@ fn scatter_nhwc(
             }
         }
     }
+}
+
+/// Elements of a buffer with these dimensions, or a shape error instead of a
+/// wrapped-around size. Callers handling untrusted sizes should also check
+/// [`limits::elements`](crate::limits::elements).
+fn buffer_len(dims: &[usize]) -> Result<usize> {
+    crate::Tensor::checked_numel(dims)
+        .ok_or_else(|| Error::Shape(format!("conv: buffer of {dims:?} overflows usize")))
 }

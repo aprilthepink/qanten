@@ -36,6 +36,9 @@ struct Args {
     /// Seconds before an inference request fails with 504.
     #[arg(long, default_value_t = 30)]
     timeout_s: u64,
+    /// Inference requests handled at once; more get 503.
+    #[arg(long, default_value_t = 256)]
+    max_concurrent: usize,
     /// Activation between layers of MLP weight files: relu, tanh, sigmoid, gelu or silu.
     #[arg(long, default_value = "relu")]
     activation: ActivationKind,
@@ -71,6 +74,7 @@ async fn main() -> Result<()> {
         max_wait: Duration::from_millis(args.max_wait_ms),
         max_body_bytes: args.max_body_mb.saturating_mul(1 << 20),
         request_timeout: Duration::from_secs(args.timeout_s.max(1)),
+        max_concurrent_requests: args.max_concurrent.max(1),
     };
     let mut state = AppState::new(&pool, config)?;
     let activation = args.activation;

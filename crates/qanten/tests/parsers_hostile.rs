@@ -91,3 +91,41 @@ fn npy_headers_cannot_request_huge_arrays() {
     );
     assert!(Tensor::new(vec![], [0, usize::MAX, 2]).is_err());
 }
+
+#[test]
+fn npz_entries_must_not_share_data() {
+    let mut sd = StateDict::new();
+    sd.insert("a", Tensor::vector(&[1.0, 2.0]));
+    sd.insert("b", Tensor::vector(&[3.0, 4.0]));
+    let mut bytes = sd.to_npz_bytes().unwrap();
+    assert!(StateDict::from_npz_bytes(&bytes).is_ok());
+    // Point the second central directory entry at the first local header:
+    // the classic overlapping-entry zip bomb.
+    let central: Vec<usize> = bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"PK\x01\x02")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(central.len(), 2);
+    let first_local: [u8; 4] = bytes[central[0] + 42..central[0] + 46].try_into().unwrap();
+    bytes[central[1] + 42..central[1] + 46].copy_from_slice(&first_local);
+    let err = StateDict::from_npz_bytes(&bytes).unwrap_err().to_string();
+    assert!(err.contains("overlaps"), "{err}");
+}
+
+#[test]
+fn safetensors_shapes_are_limited() {
+    let header = r#"{"w":{"dtype":"F32","shape":[0,1099511627776],"data_offsets":[0,0]}}"#;
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(header.as_bytes());
+    let err = StateDict::from_safetensors_bytes(&bytes).expect_err("a [0, 2^40] tensor is refused");
+    assert!(err.to_string().contains("elements"), "{err}");
+}
+
+#[test]
+fn matrix_sizes_cannot_overflow() {
+    use qanten::compute::Matrix;
+    assert!(Matrix::new(1 << 32, 1 << 32, vec![]).is_err());
+    assert!(catch_unwind(|| Matrix::zeros(1 << 33, 1 << 31)).is_err());
+}

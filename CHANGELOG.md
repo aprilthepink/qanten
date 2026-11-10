@@ -46,6 +46,40 @@ official toolkit v2.4.0.
     (`--timeout-s`), restricted model names, and escaped Prometheus labels.
   - `qanten run`: output file names are sanitised and deduplicated, and it
     refuses to write through symlinks.
+- Second security review:
+  - `qanten-serve` batches an ONNX model only when the new
+    `OnnxModel::rows_are_independent` shows it never mixes rows. Before this,
+    a model such as `Flatten(axis=0)` returned other callers' inputs. If an
+    output does not line up with the batch, each request runs alone.
+  - `qanten-serve`: `--max-concurrent` (default 256) answers 503 when the
+    server is busy, before the body is read. A timed-out request now stops
+    its model run (`OnnxModel::run_cancellable`, `Error::Cancelled`). Request
+    bodies are parsed without the untagged-enum buffering, which used about
+    20 times the body size in memory.
+  - ONNX evaluator:
+    - Every node output is checked against `limits` and for data that
+      matches its shape. Values are dropped after their last use, with a
+      4 GiB budget for what stays alive (`limits::MAX_LIVE_BYTES`), and
+      constants are no longer copied per run.
+    - Conv and ConvTranspose check their output and patch buffers before
+      allocating; huge pads used to abort the process.
+    - Pooling has a work budget (`limits::MAX_WORK`).
+    - Repeated axes in Unsqueeze, Squeeze and Slice are errors, and global
+      pools over empty planes no longer return too few values.
+    - INT64 constants keep full precision.
+    - Negative or huge input dims are treated as unknown.
+    - Protobuf element counts are bounded.
+  - npz: entries that overlap or share data are rejected (zip bomb), and
+    local header signatures are checked.
+  - safetensors: shapes go through `limits`.
+  - `compute::Matrix` sizes are overflow-checked.
+  - Driver backend:
+    - Allocation byte sizes are bounded.
+    - `matvec_resident` rejects the vectors block as the result.
+    - A malformed perf counter is an error instead of a panic.
+    - A failed free is logged.
+  - `qanten run -o` writes through a temporary file and a rename, so a
+    symlink in the output directory is replaced, never followed.
 - `NpuExecutor`: a job's in-flight count drops before its result is
   published, so `queue_depths()` is never stale right after `wait()`.
 - `compute::NpuMatrix::upload_replicated`: a full copy per NPU with batches

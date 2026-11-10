@@ -162,7 +162,7 @@ pub fn run(base: &Npu, args: RunArgs) -> Result<()> {
                 .inputs()
                 .iter()
                 .enumerate()
-                .map(|(i, spec)| {
+                .map(|(i, spec)| -> Result<(String, OnnxValue)> {
                     let given = inputs
                         .iter()
                         .find(|(n, _)| n.as_deref() == Some(spec.name.as_str()))
@@ -176,6 +176,10 @@ pub fn run(base: &Npu, args: RunArgs) -> Result<()> {
                                 .enumerate()
                                 .map(|(d, s)| s.unwrap_or(if d == 0 { args.batch } else { 1 }))
                                 .collect();
+                            // The shape comes from the model file.
+                            qanten::limits::elements(&shape).with_context(|| {
+                                format!("input `{}` has an unusable shape", spec.name)
+                            })?;
                             println!(
                                 "  no input for `{}`: using random data of shape {shape:?}",
                                 spec.name
@@ -195,9 +199,9 @@ pub fn run(base: &Npu, args: RunArgs) -> Result<()> {
                     } else {
                         OnnxValue::Float(t)
                     };
-                    (spec.name.clone(), v)
+                    Ok((spec.name.clone(), v))
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             let refs: Vec<(&str, OnnxValue)> =
                 feeds.iter().map(|(n, v)| (n.as_str(), v.clone())).collect();
             profiler.reset();
@@ -232,6 +236,7 @@ pub fn run(base: &Npu, args: RunArgs) -> Result<()> {
                         "  no input given: using random data of shape [{}, {in_features}]",
                         args.batch
                     );
+                    qanten::limits::elements(&[args.batch, in_features])?;
                     Tensor::rand_uniform([args.batch, in_features], 0.0, 1.0, 42)
                 }
             };
@@ -262,13 +267,8 @@ pub fn run(base: &Npu, args: RunArgs) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         let names: Vec<&str> = outputs.iter().map(|(n, _)| n.as_str()).collect();
         for ((_, t), file) in outputs.iter().zip(output_file_names(&names)) {
-            let path = dir.join(file);
-            // Output names come from the model file: never write through a
-            // symlink someone placed in the output directory.
-            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-                bail!("refusing to write through the symlink {}", path.display());
-            }
-            qanten::numpy::save_npy(&path, t)?;
+            let path = dir.join(&file);
+            write_replacing(dir, &file, &qanten::numpy::write_npy(t))?;
             println!("  wrote {}", path.display());
         }
     }
@@ -276,6 +276,25 @@ pub fn run(base: &Npu, args: RunArgs) -> Result<()> {
         println!("\n{}", profiler.report());
     }
     Ok(())
+}
+
+/// Writes `dir/name` without ever following a symlink there: the data goes
+/// to a new temporary file (`create_new` refuses anything already present,
+/// symlinks included) that is then renamed over `name`. A rename replaces a
+/// symlink itself, not its target, so there is no check-then-write race.
+fn write_replacing(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(data).and_then(|()| f.sync_all()))
+        .and_then(|()| std::fs::rename(&tmp, dir.join(name)));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("writing {}", dir.join(name).display()))
 }
 
 #[cfg(test)]

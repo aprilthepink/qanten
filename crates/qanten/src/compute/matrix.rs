@@ -100,10 +100,24 @@ fn dot<T: Scalar, U: Scalar>(a: &[T], b: &[U]) -> f64 {
     acc.iter().sum::<f64>() + tail
 }
 
+/// `rows · cols`, or an error instead of a wrapped-around size (which would
+/// let a matrix claim more elements than it holds).
+fn checked_len(rows: usize, cols: usize) -> Result<usize> {
+    rows.checked_mul(cols)
+        .ok_or_else(|| Error::Shape(format!("a {rows}x{cols} matrix overflows usize")))
+}
+
+/// [`checked_len`] for the infallible constructors, which panic like
+/// `Vec::with_capacity` does on an impossible size.
+fn len_or_panic(rows: usize, cols: usize) -> usize {
+    rows.checked_mul(cols)
+        .unwrap_or_else(|| panic!("a {rows}x{cols} matrix overflows usize"))
+}
+
 impl<T: Scalar> Mat<T> {
     /// From row-major data.
     pub fn new(rows: usize, cols: usize, data: Vec<T>) -> Result<Self> {
-        if data.len() != rows * cols {
+        if data.len() != checked_len(rows, cols)? {
             return Err(Error::Shape(format!(
                 "{} values do not make a {rows}x{cols} matrix",
                 data.len()
@@ -117,7 +131,7 @@ impl<T: Scalar> Mat<T> {
         Self {
             rows,
             cols,
-            data: vec![T::ZERO; rows * cols],
+            data: vec![T::ZERO; len_or_panic(rows, cols)],
         }
     }
 
@@ -128,7 +142,7 @@ impl<T: Scalar> Mat<T> {
 
     /// Element `(i, j)` is `f(i, j)`.
     pub fn from_fn(rows: usize, cols: usize, mut f: impl FnMut(usize, usize) -> T) -> Self {
-        let mut data = Vec::with_capacity(rows * cols);
+        let mut data = Vec::with_capacity(len_or_panic(rows, cols));
         for i in 0..rows {
             data.extend((0..cols).map(|j| f(i, j)));
         }
@@ -300,7 +314,7 @@ impl<T: Scalar> Mat<T> {
             )));
         }
         let n = other.rows;
-        let mut out = vec![T::ZERO; self.rows * n];
+        let mut out = vec![T::ZERO; checked_len(self.rows, n)?];
         out.par_chunks_mut(n.max(1))
             .zip(self.data.par_chunks(self.cols.max(1)))
             .for_each(|(dst, a)| {

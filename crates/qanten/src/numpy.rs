@@ -240,6 +240,10 @@ fn unzip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
         return Err(fmt_err("ZIP64 archives (> 4 GiB) are not supported"));
     }
     let mut files = Vec::with_capacity(entries);
+    // Byte ranges of the entries seen so far. Entries must not share or
+    // overlap data: otherwise a tiny archive could list one large deflated
+    // entry thousands of times and inflate it again for each listing.
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(entries);
     for _ in 0..entries {
         if !bytes
             .get(at..)
@@ -267,10 +271,21 @@ fn unzip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
         }
         at += 46 + name_len + extra_len + comment_len;
 
+        if !bytes
+            .get(local..)
+            .is_some_and(|b| b.starts_with(b"PK\x03\x04"))
+        {
+            return Err(fmt_err(format!("{name}: corrupt local file header")));
+        }
         let data_start = local + 30 + le16(bytes, local + 26)? + le16(bytes, local + 28)?;
         let raw = bytes
             .get(data_start..data_start + comp_size)
             .ok_or_else(|| fmt_err(format!("{name}: data truncated")))?;
+        let span = (local, data_start + comp_size);
+        if spans.iter().any(|&(a, b)| span.0 < b && a < span.1) {
+            return Err(fmt_err(format!("{name}: overlaps another zip entry")));
+        }
+        spans.push(span);
         // An entry never needs more than the largest tensor we accept (8-byte
         // elements) plus a generous allowance for the .npy header.
         let max_entry = crate::limits::MAX_ELEMENTS * 8 + (1 << 20);

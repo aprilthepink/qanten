@@ -259,7 +259,12 @@ impl Backend for DriverBackend {
     }
 
     fn allocate(&self, npu: u32, rows: usize, cols: usize, role: DataRole) -> Result<RawHandle> {
-        if rows.checked_mul(cols).is_none() {
+        // The driver sizes the block in bytes; keep that representable too.
+        let bytes = rows
+            .checked_mul(cols)
+            .and_then(|n| n.checked_mul(size_of::<bf16>()))
+            .filter(|&b| b <= isize::MAX as usize);
+        if bytes.is_none() {
             return Err(Error::InvalidArgument("allocation size overflows".into()));
         }
         let mut out = QantDriverHandle {
@@ -289,9 +294,16 @@ impl Backend for DriverBackend {
                 message: "invalid memory handle (double free?)".into(),
             });
         }
+        // The entry is gone even if the driver reports an error: a handle the
+        // driver may already have released must never be used again, so a
+        // failed free leaks the block rather than risking a use after free.
         // SAFETY: the handle came from `allocate`, was not freed before, and
         // no other call holds it (we own the write lock).
-        check(handle.npu, unsafe { self.lib.free(to_sys_handle(handle)) })
+        let freed = check(handle.npu, unsafe { self.lib.free(to_sys_handle(handle)) });
+        if let Err(e) = &freed {
+            tracing::warn!(npu = handle.npu, error = %e, "driver failed to free a memory block; it is leaked");
+        }
+        freed
     }
 
     fn upload(&self, handle: RawHandle, data: &[bf16]) -> Result<()> {
@@ -340,6 +352,12 @@ impl Backend for DriverBackend {
         if matrix.npu != vectors.npu || matrix.npu != result.npu {
             return Err(Error::InvalidArgument(
                 "operands live on different NPUs".into(),
+            ));
+        }
+        if vectors == result {
+            return Err(Error::InvalidArgument(
+                "the result must not be the vectors block (the driver reads one while writing the other)"
+                    .into(),
             ));
         }
         if m.role != DataRole::Weights
@@ -413,9 +431,18 @@ impl Backend for DriverBackend {
         let mut out = PerformanceCounterInfo::default();
         // SAFETY: `out` is a valid destination.
         check(npu, unsafe { self.lib.get_perf_counter(npu, &mut out) })?;
+        // A counter that is NaN, infinite or beyond `Duration` is a driver
+        // fault, not a reason to panic.
+        let secs = |what: &str, v: f64| {
+            Duration::try_from_secs_f64(v.max(0.0)).map_err(|_| Error::Driver {
+                npu,
+                code: -1,
+                message: format!("invalid {what} counter {v}"),
+            })
+        };
         Ok(PerfCounters {
-            elapsed: Duration::from_secs_f64(out.timebased_counter.max(0.0)),
-            stalled: Duration::from_secs_f64(out.stalling_counter.max(0.0)),
+            elapsed: secs("elapsed", out.timebased_counter)?,
+            stalled: secs("stalled", out.stalling_counter)?,
         })
     }
 

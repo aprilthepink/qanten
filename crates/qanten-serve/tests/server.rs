@@ -317,3 +317,155 @@ async fn model_names_are_restricted() {
             .is_ok()
     );
 }
+
+/// A one-node ONNX model `y = Flatten(x, axis=0)`: it merges all rows into
+/// one, so batching it would mix callers' data.
+fn flatten_axis0_model() -> Vec<u8> {
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    fn field(num: u64, b: &[u8], out: &mut Vec<u8>) {
+        varint((num << 3) | 2, out);
+        varint(b.len() as u64, out);
+        out.extend_from_slice(b);
+    }
+    fn int(num: u64, v: u64, out: &mut Vec<u8>) {
+        varint(num << 3, out);
+        varint(v, out);
+    }
+    // ValueInfo `name`: float tensor of shape [batch, 2].
+    let value_info = |name: &str, dims: &[Option<u64>]| {
+        let mut shape = Vec::new();
+        for d in dims {
+            let mut dim = Vec::new();
+            match d {
+                Some(v) => int(1, *v, &mut dim),
+                None => field(2, b"batch", &mut dim),
+            }
+            field(1, &dim, &mut shape);
+        }
+        let mut tensor_type = Vec::new();
+        int(1, 1, &mut tensor_type);
+        field(2, &shape, &mut tensor_type);
+        let mut type_proto = Vec::new();
+        field(1, &tensor_type, &mut type_proto);
+        let mut v = Vec::new();
+        field(1, name.as_bytes(), &mut v);
+        field(2, &type_proto, &mut v);
+        v
+    };
+    let mut attr = Vec::new();
+    field(1, b"axis", &mut attr);
+    int(3, 0, &mut attr);
+    let mut node = Vec::new();
+    field(1, b"x", &mut node);
+    field(2, b"y", &mut node);
+    field(4, b"Flatten", &mut node);
+    field(5, &attr, &mut node);
+    let mut g = Vec::new();
+    field(1, &node, &mut g);
+    field(11, &value_info("x", &[None, Some(2)]), &mut g);
+    field(12, &value_info("y", &[]), &mut g);
+    let mut opset = Vec::new();
+    int(2, 17, &mut opset);
+    let mut m = Vec::new();
+    int(1, 8, &mut m);
+    field(8, &opset, &mut m);
+    field(7, &g, &mut m);
+    m
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn row_mixing_models_never_share_a_batch() {
+    let path = std::env::temp_dir().join(format!("qanten-flatten0-{}.onnx", std::process::id()));
+    std::fs::write(&path, flatten_axis0_model()).unwrap();
+    let pool = NpuPool::simulated(1).unwrap();
+    let mut state = AppState::new(
+        &pool,
+        ServerConfig {
+            max_wait: Duration::from_millis(50),
+            ..ServerConfig::default()
+        },
+    )
+    .unwrap();
+    state
+        .add_model_file("flat", &path, ActivationKind::Relu)
+        .unwrap();
+    state
+        .add_model_file(
+            "mlp",
+            format!("{ONNX}/mlp.onnx").as_ref(),
+            ActivationKind::Relu,
+        )
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let app = router(Arc::new(state));
+
+    let (_, models) = call(&app, "GET", "/v1/models", None).await;
+    let batching = |name: &str| {
+        models["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == name)
+            .unwrap()["dynamic_batching"]
+            .as_bool()
+            .unwrap()
+    };
+    assert!(!batching("flat"), "Flatten(axis=0) mixes rows");
+    assert!(batching("mlp"), "an MLP is row-wise");
+
+    // Two concurrent callers each get exactly their own rows back.
+    let req = |data: [f64; 2]| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                "/v1/models/flat/infer",
+                Some(serde_json::json!({ "shape": [1, 2], "data": data })),
+            )
+            .await
+        }
+    };
+    let ((s1, a), (s2, b)) = tokio::join!(req([1.0, 2.0]), req([768.0, 896.0]));
+    assert_eq!((s1, s2), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(a["outputs"]["y"]["data"], serde_json::json!([1.0, 2.0]));
+    assert_eq!(b["outputs"]["y"]["data"], serde_json::json!([768.0, 896.0]));
+}
+
+#[tokio::test]
+async fn busy_server_answers_503() {
+    let pool = NpuPool::simulated(1).unwrap();
+    // No permits at all: every inference request finds the server busy.
+    let mut state = AppState::new(
+        &pool,
+        ServerConfig {
+            max_concurrent_requests: 0,
+            ..ServerConfig::default()
+        },
+    )
+    .unwrap();
+    state
+        .add_model_file(
+            "mlp",
+            format!("{ONNX}/mlp.onnx").as_ref(),
+            ActivationKind::Relu,
+        )
+        .unwrap();
+    let app = router(Arc::new(state));
+    let (s, _) = call(
+        &app,
+        "POST",
+        "/v1/models/mlp/infer",
+        Some(serde_json::json!({ "shape": [1, 4], "data": [0, 0, 0, 0] })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+    // Other routes are not limited.
+    assert_eq!(call(&app, "GET", "/health", None).await.0, StatusCode::OK);
+}

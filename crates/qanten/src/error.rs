@@ -49,6 +49,10 @@ pub enum Error {
     #[error("format error: {0}")]
     Format(String),
 
+    /// The caller cancelled the operation (for example after a timeout).
+    #[error("cancelled")]
+    Cancelled,
+
     #[error(transparent)]
     /// File system error (e.g. reading a weights file).
     Io(#[from] std::io::Error),

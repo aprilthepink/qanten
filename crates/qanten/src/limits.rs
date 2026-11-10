@@ -11,6 +11,17 @@ use crate::error::{Error, Result};
 /// source: 2²⁸ (512 MiB as bf16, 1 GiB as f32, 2 GiB as i64/f64).
 pub const MAX_ELEMENTS: usize = 1 << 28;
 
+/// Largest total size of the values an ONNX evaluation keeps alive at once
+/// (4 GiB). Without it, a small graph of many large nodes could hold each at
+/// the per-tensor limit.
+pub const MAX_LIVE_BYTES: usize = 1 << 32;
+
+/// Largest number of inner-loop steps one host-side operator may take on
+/// untrusted parameters (about a few seconds of CPU). Bounds ops whose cost
+/// grows with an attribute rather than with their output, such as pooling
+/// windows.
+pub const MAX_WORK: usize = 1 << 32;
+
 /// Largest rank accepted from an untrusted source.
 pub const MAX_RANK: usize = 32;
 
@@ -37,4 +48,19 @@ pub fn elements(shape: &[usize]) -> Result<usize> {
         )));
     }
     Ok(n)
+}
+
+/// Checks that an operator's estimated cost, `factors` multiplied together,
+/// stays within [`MAX_WORK`].
+pub fn work(what: &str, factors: &[usize]) -> Result<()> {
+    let total = factors
+        .iter()
+        .try_fold(1usize, |acc, &f| acc.checked_mul(f))
+        .filter(|&t| t <= MAX_WORK);
+    match total {
+        Some(_) => Ok(()),
+        None => Err(Error::InvalidArgument(format!(
+            "{what} would take more than {MAX_WORK} steps"
+        ))),
+    }
 }

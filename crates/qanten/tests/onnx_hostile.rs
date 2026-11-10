@@ -403,3 +403,232 @@ fn corrupted_fixture_models_never_panic() {
         }
     }
 }
+
+// ---- multi-node graphs and typed inputs ------------------------------------
+
+/// A graph input with dims; `None` is a symbolic dimension.
+fn value_info_dims(name: &str, elem_type: i64, dims: &[Option<i64>]) -> Vec<u8> {
+    let mut shape = Vec::new();
+    for d in dims {
+        let mut dim = Vec::new();
+        if let Some(v) = d {
+            int_field(1, *v, &mut dim);
+        } else {
+            bytes_field(2, b"batch", &mut dim);
+        }
+        bytes_field(1, &dim, &mut shape);
+    }
+    let mut tensor_type = Vec::new();
+    int_field(1, elem_type, &mut tensor_type);
+    bytes_field(2, &shape, &mut tensor_type);
+    let mut type_proto = Vec::new();
+    bytes_field(1, &tensor_type, &mut type_proto);
+    let mut v = Vec::new();
+    bytes_field(1, name.as_bytes(), &mut v);
+    bytes_field(2, &type_proto, &mut v);
+    v
+}
+
+/// A model with several nodes, a float input `x` of shape `x_dims`, output `y`.
+fn graph(nodes: &[Vec<u8>], initializers: &[Vec<u8>], x_dims: &[Option<i64>]) -> Vec<u8> {
+    let mut g = Vec::new();
+    for n in nodes {
+        bytes_field(1, n, &mut g);
+    }
+    for t in initializers {
+        bytes_field(5, t, &mut g);
+    }
+    bytes_field(11, &value_info_dims("x", FLOAT, x_dims), &mut g);
+    bytes_field(12, &value_info("y", FLOAT), &mut g);
+    let mut opset = Vec::new();
+    int_field(2, 17, &mut opset);
+    let mut m = Vec::new();
+    int_field(1, 8, &mut m);
+    bytes_field(8, &opset, &mut m);
+    bytes_field(7, &g, &mut m);
+    m
+}
+
+fn load(bytes: &[u8]) -> OnnxModel {
+    OnnxModel::from_bytes(&Npu::simulator(), bytes).expect("model loads")
+}
+
+#[test]
+fn second_review_findings_stay_fixed() {
+    // Conv whose pads make the output 131073² positions: an error, not an
+    // allocation abort.
+    let conv = node(
+        "Conv",
+        &["x", "w"],
+        &["y"],
+        &[Attr::Ints("pads", &[65536, 65536, 65536, 65536])],
+    );
+    let w = tensor("w", FLOAT, &[1, 1, 1, 1], &1f32.to_le_bytes());
+    expect_err(
+        &model(conv, &[w], &[("x", FLOAT)]),
+        &[("x", float_input(&[1, 1, 1, 1]))],
+        "Conv with 64k pads",
+    );
+
+    // Pooling cost grows with the window, not the output.
+    let pool = node(
+        "MaxPool",
+        &["x"],
+        &["y"],
+        &[Attr::Ints("kernel_shape", &[65536, 65536])],
+    );
+    expect_err(
+        &model(pool, &[], &[("x", FLOAT)]),
+        &[("x", float_input(&[1, 4, 1, 1]))],
+        "MaxPool with a 64k x 64k window",
+    );
+
+    // Repeated axes used to index past the shape.
+    let unsqueeze = node("Unsqueeze", &["x", "axes"], &["y"], &[]);
+    expect_err(
+        &model(unsqueeze, &[ints("axes", &[1, 1])], &[("x", FLOAT)]),
+        &[("x", float_input(&[]))],
+        "Unsqueeze with repeated axes",
+    );
+    let slice = node("Slice", &["x", "s", "e", "a"], &["y"], &[]);
+    expect_err(
+        &model(
+            slice,
+            &[ints("s", &[5, 0]), ints("e", &[10, 10]), ints("a", &[0, 0])],
+            &[("x", FLOAT)],
+        ),
+        &[("x", float_input(&[10]))],
+        "Slice with repeated axes",
+    );
+
+    // A reshape to [0, 2^40] holds no data but made later ops loop 2^40 times.
+    let reshape = node("Reshape", &["x", "s"], &["y"], &[]);
+    expect_err(
+        &model(reshape, &[ints("s", &[0, 1 << 40])], &[("x", FLOAT)]),
+        &[("x", float_input(&[0]))],
+        "Reshape to [0, 2^40]",
+    );
+
+    // Global pools over empty planes still give one value per channel, so a
+    // following op sees data that matches the shape.
+    let gap = node("GlobalAveragePool", &["x"], &["p"], &[]);
+    let add = node("Add", &["p", "b"], &["y"], &[]);
+    let out = run(
+        &graph(
+            &[gap, add],
+            &[floats("b", &[1.0])],
+            &[None, Some(3), None, None],
+        ),
+        &[("x", float_input(&[1, 3, 0, 5]))],
+    )
+    .expect("runs");
+    let OnnxValue::Float(t) = &out[0].1 else {
+        panic!("float output")
+    };
+    assert_eq!(t.shape(), [1, 3, 1, 1]);
+    assert!(t.to_f32_vec().iter().all(|v| v.is_nan()));
+}
+
+#[test]
+fn negative_and_huge_input_dims_are_unknown() {
+    let id = node("Identity", &["x"], &["y"], &[]);
+    let m = load(&graph(&[id], &[], &[Some(-1), Some(1 << 33), Some(4)]));
+    assert_eq!(m.inputs()[0].shape, [None, None, Some(4)]);
+}
+
+#[test]
+fn int64_constants_keep_full_precision() {
+    let big = (1i64 << 53) + 1;
+    let id = node("Identity", &["c"], &["y"], &[]);
+    let out = run(&model(id, &[ints("c", &[big])], &[]), &[]).unwrap();
+    assert_eq!(
+        out[0].1,
+        OnnxValue::Int {
+            data: vec![big],
+            shape: vec![1]
+        }
+    );
+}
+
+#[test]
+fn cancelled_runs_stop() {
+    use std::sync::atomic::AtomicBool;
+    let relu = node("Relu", &["x"], &["y"], &[]);
+    let m = load(&graph(&[relu], &[], &[None, Some(2)]));
+    let x = [("x", float_input(&[1, 2]))];
+    assert!(m.run_cancellable(&x, &AtomicBool::new(false)).is_ok());
+    assert!(matches!(
+        m.run_cancellable(&x, &AtomicBool::new(true)),
+        Err(qanten::Error::Cancelled)
+    ));
+}
+
+#[test]
+fn row_independence_is_detected_conservatively() {
+    let rows = [None, Some(2)];
+    let independent = |nodes: &[Vec<u8>], inits: &[Vec<u8>]| {
+        load(&graph(nodes, inits, &rows)).rows_are_independent()
+    };
+    let matrix = tensor(
+        "w",
+        FLOAT,
+        &[2, 3],
+        &[0f32; 6]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<u8>>(),
+    );
+
+    // Row-wise.
+    assert!(independent(&[node("Relu", &["x"], &["y"], &[])], &[]));
+    assert!(independent(
+        &[node("MatMul", &["x", "w"], &["y"], &[])],
+        std::slice::from_ref(&matrix)
+    ));
+    assert!(independent(
+        &[node("Flatten", &["x"], &["y"], &[Attr::Int("axis", 1)])],
+        &[]
+    ));
+    assert!(independent(
+        &[node("Softmax", &["x"], &["y"], &[Attr::Int("axis", -1)])],
+        &[]
+    ));
+    assert!(independent(
+        &[node("Add", &["x", "b"], &["y"], &[])],
+        &[floats("b", &[1.0, 2.0])]
+    ));
+
+    // Mixes rows, or might.
+    assert!(!independent(
+        &[node("Flatten", &["x"], &["y"], &[Attr::Int("axis", 0)])],
+        &[]
+    ));
+    assert!(!independent(
+        &[node("Softmax", &["x"], &["y"], &[Attr::Int("axis", 0)])],
+        &[]
+    ));
+    assert!(!independent(
+        &[node("ReduceSum", &["x", "a"], &["y"], &[])],
+        &[ints("a", &[0])]
+    ));
+    assert!(!independent(&[node("Transpose", &["x"], &["y"], &[])], &[]));
+    assert!(!independent(
+        &[node("Reshape", &["x", "s"], &["y"], &[])],
+        &[ints("s", &[1, -1])]
+    ));
+    assert!(!independent(&[node("Shape", &["x"], &["y"], &[])], &[]));
+    // A constant that varies along the batch axis adds different values to
+    // different callers' rows.
+    assert!(!independent(
+        &[node("Add", &["x", "b"], &["y"], &[])],
+        &[tensor(
+            "b",
+            FLOAT,
+            &[2, 2],
+            &[0f32; 4]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>()
+        )]
+    ));
+}

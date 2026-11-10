@@ -17,7 +17,8 @@ qanten-serve --sim --sim-npus 2 -m classifier=model.onnx
 | `--max-batch` | 64 | maximum rows per NPU batch |
 | `--max-wait-ms` | 2 | how long to wait for more requests to batch |
 | `--max-body-mb` | 16 | larger request bodies get 413 |
-| `--timeout-s` | 30 | inference slower than this gets 504 |
+| `--timeout-s` | 30 | inference slower than this gets 504; its work stops between model nodes |
+| `--max-concurrent` | 256 | inference requests handled at once; more get 503 straight away |
 | `--activation` | `relu` | between layers of MLP weight files |
 | `--sim`, `--sim-npus N` | off, 1 | simulated NPUs instead of hardware |
 
@@ -70,6 +71,13 @@ curl -s -X POST localhost:8080/v1/models/mlp/infer -H 'content-type: application
   along the batch dimension, runs one NPU job, and splits the outputs back per request.
   Requests whose shapes don't match the batch run on their own. Models with several
   inputs or integer inputs (e.g. token ids) skip batching.
+- **Batching never mixes callers.** An ONNX model is batched only if
+  `OnnxModel::rows_are_independent()` shows that every output row depends only on the
+  matching input row. Ops such as `Shape`, reductions or softmax over the batch axis, or
+  reshapes that move it, turn batching off for that model (`/v1/models` shows
+  `"dynamic_batching": false`). If a batch output still doesn't line up with the batch
+  rows, each request is rerun on its own. Modules added with `add_module` are batched,
+  so they must process rows independently.
 - **Load balancing.** Each batch is a job on an `NpuExecutor`, which sends it to the NPU
   with the fewest jobs queued or running. Batches for the same model run on different
   cards at the same time.

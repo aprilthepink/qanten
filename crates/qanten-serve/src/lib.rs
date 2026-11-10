@@ -7,7 +7,9 @@
 //!   [`NpuPool`]; requests go to whichever NPU is free.
 //! - **Dynamic batching**: concurrent requests to a single-input model are
 //!   merged into one NPU batch (up to `max_batch_rows` rows or `max_wait`),
-//!   then split back per request.
+//!   then split back per request. ONNX models are batched only when
+//!   [`OnnxModel::rows_are_independent`] proves no output row depends on
+//!   another caller's input.
 //! - JSON API, `/health`, and Prometheus `/metrics` with request and NPU counters.
 //!
 //! The binary (`qanten-serve`) wraps [`AppState`] and [`router`]; both are
@@ -17,11 +19,12 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -32,7 +35,7 @@ use qanten::pool::NpuPool;
 use qanten::profile::{OpKind, Profiler};
 use qanten::{Npu, Tensor};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
 /// Server tuning and limits.
 #[derive(Debug, Clone, Copy)]
@@ -43,8 +46,12 @@ pub struct ServerConfig {
     pub max_wait: Duration,
     /// Largest accepted request body.
     pub max_body_bytes: usize,
-    /// An inference request that takes longer fails with 504.
+    /// An inference request that takes longer fails with 504, and its work
+    /// is cancelled between model nodes.
     pub request_timeout: Duration,
+    /// Inference requests handled at once; more get 503 straight away. This
+    /// bounds the work queued per NPU and the memory held by request bodies.
+    pub max_concurrent_requests: usize,
 }
 
 impl Default for ServerConfig {
@@ -54,6 +61,7 @@ impl Default for ServerConfig {
             max_wait: Duration::from_millis(2),
             max_body_bytes: 16 << 20,
             request_timeout: Duration::from_secs(30),
+            max_concurrent_requests: 256,
         }
     }
 }
@@ -93,29 +101,46 @@ pub struct InputSpec {
 
 type Outputs = Vec<(String, OnnxValue)>;
 
-/// A loaded model: kind, inputs, outputs, one runner per NPU.
+/// A loaded model: kind, inputs, outputs, one runner per NPU, and whether
+/// requests from different callers may share a batch.
 type Loaded = (
     &'static str,
     Vec<InputSpec>,
     Vec<String>,
     Vec<Arc<dyn Runner>>,
+    bool,
 );
+
+/// Sets a cancellation flag when dropped, i.e. when the request that owns it
+/// finishes or is abandoned (timeout, client gone).
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 
 /// Something that can be served.
 trait Runner: Send + Sync {
-    fn run(&self, inputs: &[(&str, OnnxValue)]) -> qanten::Result<Outputs>;
+    /// Runs the model; stops early with [`qanten::Error::Cancelled`] once
+    /// `cancel` is set, where the model can.
+    fn run(&self, inputs: &[(&str, OnnxValue)], cancel: &AtomicBool) -> qanten::Result<Outputs>;
 }
 
 impl Runner for OnnxModel {
-    fn run(&self, inputs: &[(&str, OnnxValue)]) -> qanten::Result<Outputs> {
-        OnnxModel::run(self, inputs)
+    fn run(&self, inputs: &[(&str, OnnxValue)], cancel: &AtomicBool) -> qanten::Result<Outputs> {
+        self.run_cancellable(inputs, cancel)
     }
 }
 
 struct ModuleRunner(Box<dyn Module>);
 
 impl Runner for ModuleRunner {
-    fn run(&self, inputs: &[(&str, OnnxValue)]) -> qanten::Result<Outputs> {
+    fn run(&self, inputs: &[(&str, OnnxValue)], cancel: &AtomicBool) -> qanten::Result<Outputs> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(qanten::Error::Cancelled);
+        }
         let x = inputs
             .first()
             .ok_or_else(|| qanten::Error::InvalidArgument("missing input".into()))?
@@ -141,6 +166,8 @@ struct Stats {
 struct BatchItem {
     input: Tensor,
     reply: oneshot::Sender<Result<(Outputs, usize), String>>,
+    /// Set once the request is abandoned.
+    cancelled: Arc<AtomicBool>,
 }
 
 struct ModelEntry {
@@ -160,6 +187,8 @@ pub struct AppState {
     exec: Arc<NpuExecutor>,
     models: BTreeMap<String, Arc<ModelEntry>>,
     config: ServerConfig,
+    /// Permits for in-flight inference requests.
+    in_flight: Arc<Semaphore>,
     started: Instant,
     backend: String,
 }
@@ -193,6 +222,7 @@ impl AppState {
             profilers,
             models: BTreeMap::new(),
             config,
+            in_flight: Arc::new(Semaphore::new(config.max_concurrent_requests)),
             started: Instant::now(),
             backend,
         })
@@ -211,7 +241,7 @@ impl AppState {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        let (kind, inputs, outputs, replicas): Loaded = match ext.as_str() {
+        let (kind, inputs, outputs, replicas, batchable): Loaded = match ext.as_str() {
             "onnx" => {
                 let bytes = std::fs::read(path)?;
                 let models = self
@@ -230,6 +260,7 @@ impl AppState {
                     })
                     .collect();
                 let outputs = models[0].outputs().to_vec();
+                let batchable = models[0].rows_are_independent();
                 (
                     "onnx",
                     inputs,
@@ -238,6 +269,7 @@ impl AppState {
                         .into_iter()
                         .map(|m| Arc::new(m) as Arc<dyn Runner>)
                         .collect(),
+                    batchable,
                 )
             }
             "safetensors" | "npz" => {
@@ -254,18 +286,24 @@ impl AppState {
                     shape: vec![None, Some(in_features)],
                     integer: false,
                 }];
-                ("mlp", inputs, vec!["output".into()], replicas)
+                // Dense layers and activations are row-wise.
+                ("mlp", inputs, vec!["output".into()], replicas, true)
             }
             other => {
                 anyhow::bail!("unsupported model format .{other} (use .onnx, .safetensors or .npz)")
             }
         };
-        self.insert(name, kind, inputs, outputs, replicas);
+        self.insert(name, kind, inputs, outputs, replicas, batchable);
         Ok(())
     }
 
     /// Serves an already-built module (single input called `input`, output `output`)
     /// built once per NPU by `build`. Must be called inside a tokio runtime.
+    ///
+    /// Requests are batched, so the module must process the rows of its
+    /// input independently (true for MLPs and convolutional nets in
+    /// inference mode); otherwise one caller's result would depend on, and
+    /// could reveal, another caller's input.
     pub fn add_module<M, F>(
         &mut self,
         name: &str,
@@ -288,7 +326,14 @@ impl AppState {
             shape: vec![None, Some(in_features)],
             integer: false,
         }];
-        self.insert(name, "module", inputs, vec!["output".into()], replicas);
+        self.insert(
+            name,
+            "module",
+            inputs,
+            vec!["output".into()],
+            replicas,
+            true,
+        );
         Ok(())
     }
 
@@ -299,9 +344,10 @@ impl AppState {
         inputs: Vec<InputSpec>,
         outputs: Vec<String>,
         replicas: Vec<Arc<dyn Runner>>,
+        rows_independent: bool,
     ) {
-        // Batch only single float-input models.
-        let batchable = inputs.len() == 1 && !inputs[0].integer;
+        // Batch only single float-input models that never mix rows.
+        let batchable = rows_independent && inputs.len() == 1 && !inputs[0].integer;
         let mut entry = ModelEntry {
             kind,
             inputs,
@@ -343,7 +389,7 @@ async fn batcher(
             items
                 .iter()
                 .map(|i| i.input.shape().first().copied().unwrap_or(1))
-                .sum::<usize>()
+                .fold(0usize, usize::saturating_add)
         };
         while rows(&items) < cfg.max_batch_rows {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -371,6 +417,49 @@ async fn batcher(
     }
 }
 
+/// Runs `input` on whichever NPU is free, stopping early once `cancel` is set.
+async fn run_on_pool(
+    entry: &Arc<ModelEntry>,
+    exec: &NpuExecutor,
+    pool: &NpuPool,
+    input: Tensor,
+    cancel: Arc<AtomicBool>,
+) -> Result<Outputs, String> {
+    let model = Arc::clone(entry);
+    let pool = pool.clone();
+    exec.run(move |npu| {
+        let name = model.inputs[0].name.as_str();
+        model.replicas[replica_index(&pool, npu)].run(&[(name, OnnxValue::Float(input))], &cancel)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Splits every output of a batch along axis 0 into one piece per request.
+/// `None` if an output's first dimension is not the batch: the model did not
+/// keep rows apart for this input, so the batch must not be shared.
+fn split_outputs(outputs: Outputs, sizes: &[usize]) -> Result<Option<Vec<Outputs>>, String> {
+    let total: usize = sizes.iter().sum();
+    let mut per_item: Vec<Outputs> = vec![Vec::new(); sizes.len()];
+    for (name, value) in outputs {
+        let t = value.into_tensor().map_err(|e| e.to_string())?;
+        if t.shape().first() != Some(&total) {
+            return Ok(None);
+        }
+        let row = t.len() / total.max(1);
+        let mut start = 0;
+        for (k, &n) in sizes.iter().enumerate() {
+            let mut shape = t.shape().to_vec();
+            shape[0] = n;
+            let piece = Tensor::new(t.data()[start * row..(start + n) * row].to_vec(), shape)
+                .map_err(|e| e.to_string())?;
+            start += n;
+            per_item[k].push((name.clone(), OnnxValue::Float(piece)));
+        }
+    }
+    Ok(Some(per_item))
+}
+
 async fn run_batch(
     entry: Arc<ModelEntry>,
     exec: Arc<NpuExecutor>,
@@ -379,59 +468,51 @@ async fn run_batch(
 ) {
     let sizes: Vec<usize> = group.iter().map(|i| i.input.shape()[0]).collect();
     let total: usize = sizes.iter().sum();
-    let parts: Vec<Tensor> = group.iter().map(|i| i.input.clone()).collect();
-    let input_name = entry.inputs[0].name.clone();
-    let model = Arc::clone(&entry);
-    let result = match Tensor::concat_batch(&parts) {
-        Ok(batch) => exec
-            .run(move |npu| {
-                let r = &model.replicas[replica_index(&pool, npu)];
-                r.run(&[(input_name.as_str(), OnnxValue::Float(batch))])
-            })
-            .await
-            .map_err(|e| e.to_string()),
-        Err(e) => Err(e.to_string()),
-    };
     entry.stats.batches.fetch_add(1, Ordering::Relaxed);
     entry
         .stats
         .batched_rows
         .fetch_add(total as u64, Ordering::Relaxed);
-    match result {
-        Ok(outputs) => {
-            // Split every output along its first dimension, if it is the batch dimension.
-            let mut per_item: Vec<Outputs> = vec![Vec::new(); group.len()];
-            for (name, value) in outputs {
-                let t = match value.into_tensor() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        for item in group {
-                            let _ = item.reply.send(Err(e.to_string()));
-                        }
-                        return;
-                    }
-                };
-                if t.shape().first() == Some(&total) {
-                    let row = t.len() / total.max(1);
-                    let mut start = 0;
-                    for (k, &n) in sizes.iter().enumerate() {
-                        let mut shape = t.shape().to_vec();
-                        shape[0] = n;
-                        let piece =
-                            Tensor::new(t.data()[start * row..(start + n) * row].to_vec(), shape);
-                        start += n;
-                        if let Ok(piece) = piece {
-                            per_item[k].push((name.clone(), OnnxValue::Float(piece)));
-                        }
-                    }
-                } else {
-                    for p in &mut per_item {
-                        p.push((name.clone(), OnnxValue::Float(t.clone())));
-                    }
-                }
+    // The batch is cancelled once every request in it has been abandoned.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let flags: Vec<Arc<AtomicBool>> = group.iter().map(|i| Arc::clone(&i.cancelled)).collect();
+        let cancel = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            while !flags.iter().all(|f| f.load(Ordering::Relaxed)) {
+                tick.tick().await;
             }
+            cancel.store(true, Ordering::Relaxed);
+        })
+    };
+    let parts: Vec<Tensor> = group.iter().map(|i| i.input.clone()).collect();
+    let result = match Tensor::concat_batch(&parts) {
+        Ok(batch) => run_on_pool(&entry, &exec, &pool, batch, Arc::clone(&cancel)).await,
+        Err(e) => Err(e.to_string()),
+    };
+    watcher.abort();
+    let mut group = group;
+    if group.len() == 1 {
+        // A batch of one is the request itself, whatever its output shapes.
+        if let Some(item) = group.pop() {
+            let _ = item.reply.send(result.map(|o| (o, total)));
+        }
+        return;
+    }
+    match result.and_then(|out| split_outputs(out, &sizes)) {
+        Ok(Some(per_item)) => {
             for (item, out) in group.into_iter().zip(per_item) {
                 let _ = item.reply.send(Ok((out, total)));
+            }
+        }
+        // Rows were not kept apart: never hand one caller another's data.
+        // Run each request on its own instead.
+        Ok(None) => {
+            for item in group {
+                let rows = item.input.shape()[0];
+                let out = run_on_pool(&entry, &exec, &pool, item.input, item.cancelled).await;
+                let _ = item.reply.send(out.map(|o| (o, rows)));
             }
         }
         Err(e) => {
@@ -456,7 +537,7 @@ pub struct JsonTensor {
 /// Body of `POST /v1/models/{name}/infer`: either `{"inputs": {"x": tensor, ...}}`
 /// or, for single-input models, just a tensor.
 #[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[serde(try_from = "RawInferRequest")]
 pub enum InferRequest {
     /// Named inputs.
     Named {
@@ -465,6 +546,36 @@ pub enum InferRequest {
     },
     /// The only input.
     Single(JsonTensor),
+}
+
+/// Both request forms as one struct. Deserializing it streams the body
+/// straight into the vectors; `#[serde(untagged)]` would first buffer the
+/// whole body as generic JSON, using many times its size in memory.
+#[derive(Deserialize)]
+struct RawInferRequest {
+    inputs: Option<BTreeMap<String, JsonTensor>>,
+    shape: Option<Vec<usize>>,
+    data: Option<Vec<f64>>,
+}
+
+impl TryFrom<RawInferRequest> for InferRequest {
+    type Error = &'static str;
+
+    fn try_from(r: RawInferRequest) -> Result<Self, Self::Error> {
+        match r {
+            RawInferRequest {
+                inputs: Some(inputs),
+                shape: None,
+                data: None,
+            } => Ok(Self::Named { inputs }),
+            RawInferRequest {
+                inputs: None,
+                shape: Some(shape),
+                data: Some(data),
+            } => Ok(Self::Single(JsonTensor { shape, data })),
+            _ => Err(r#"expected {"inputs": {...}} or {"shape": [...], "data": [...]}"#),
+        }
+    }
 }
 
 /// Response of an inference request.
@@ -615,6 +726,10 @@ async fn infer_inner(
             BTreeMap::from([(first.name.clone(), t)])
         }
     };
+    // Stops the model between nodes once this request is abandoned (the
+    // timeout in `infer` drops this future) or done.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
     let mut values = Vec::with_capacity(entry.inputs.len());
     for spec in &entry.inputs {
         let t = named
@@ -632,9 +747,13 @@ async fn infer_inner(
             }
         };
         let (reply, wait) = oneshot::channel();
-        tx.send(BatchItem { input, reply })
-            .await
-            .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "batcher stopped".into()))?;
+        tx.send(BatchItem {
+            input,
+            reply,
+            cancelled: Arc::clone(&cancelled),
+        })
+        .await
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "batcher stopped".into()))?;
         let r = wait
             .await
             .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "batch dropped".into()))?;
@@ -653,7 +772,7 @@ async fn infer_inner(
                 .iter()
                 .map(|(n, v)| (n.as_str(), v.clone()))
                 .collect();
-            model.replicas[replica_index(&pool, npu)].run(&refs)
+            model.replicas[replica_index(&pool, npu)].run(&refs, &cancelled)
         })
         .await
         .map_err(bad_request)?;
@@ -765,6 +884,20 @@ async fn metrics(State(s): State<Arc<AppState>>) -> impl IntoResponse {
     )
 }
 
+/// Rejects an inference request with 503 when `max_concurrent_requests` are
+/// already in flight. It runs before the body is read, so waiting requests
+/// hold no memory and the per-NPU queues stay short.
+async fn limit_in_flight(State(s): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+    match Arc::clone(&s.in_flight).try_acquire_owned() {
+        Ok(_permit) => next.run(req).await,
+        Err(_) => ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server busy, retry later".into(),
+        )
+        .into_response(),
+    }
+}
+
 /// The HTTP routes:
 ///
 /// | Method | Path | |
@@ -778,7 +911,13 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
-        .route("/v1/models/{name}/infer", post(infer))
+        .route(
+            "/v1/models/{name}/infer",
+            post(infer).layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                limit_in_flight,
+            )),
+        )
         .route("/metrics", get(metrics))
         .layer(body_limit)
         .with_state(state)
